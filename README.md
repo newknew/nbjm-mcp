@@ -1,0 +1,169 @@
+# nbjm-mcp
+
+This MCP server gives Claude full read/write access to your Notion workspace.
+
+- **Token-efficient** — a typical Notion page is 50-100KB of JSON from the API. This server compresses that to 2-5KB of readable text (87-92% reduction), so Claude can work with large workspaces without blowing through context.
+- **Parallel read/write** — mutations execute concurrently with async rate limiting. Batch edits to a page happen in parallel, not one block at a time.
+- **Broad block type coverage** — 16 block types, inline formatting, database CRUD, table read/write, column layouts, and database schema management. Not universal yet (synced blocks and media are read-only).
+
+## How it works
+
+Doesn't Notion basically feel like fancy markdown? Well, that's the entire idea here. When you read a Notion page through this server, you get back something that looks like this:
+
+```
+R4kQ # Potential names for my cat
+t9Xm > Serious contenders
+pL3n   - **Gerald**
+vB8s     - Very distinguished
+J2wE   - **Margaret** :red[(vetoed @date:2026-02-14)]
+hA3z > Backups
+dR5v   - **Dr. Philip Hoffmann III**
+wU6j # Potential names for my newborn
+bT1y - :blue[Mr. Beans] (current frontrunner)
+xF4p   - Pros: already responds to it
+gN9s   - Cons: none
+kD2r - Mittens
+eP5m   - *Does this sound too much like a cat?*
+gI7N   - See @p:R4kQ
+```
+
+There are many small differences from markdown — `>` is a toggle (foldable section), `@p:R4kQ` is a page mention, and [following Streamlit](https://docs.streamlit.io/develop/api-reference/text/st.markdown), `:red[...]` is colored text — but the format is designed to be immediately readable without learning anything new. For the full specification covering all block types, inline formatting, mutation commands, and error codes, see [docs/nbjm-spec.md](docs/nbjm-spec.md).
+
+One big departure from markdown is those four-character codes on the left (`R4kQ`, `t9Xm`, ...). Each one is a token-efficient reference to a Notion block. The MCP server manages these IDs across reads and writes so that edits target the correct blocks.
+
+## Prerequisites
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [Codex](https://developers.openai.com/codex/) (untested) or another MCP client
+- A [Notion](https://www.notion.so/) account with an API integration
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (Python package manager)
+
+> **Note:** Only tested on Ubuntu so far.
+
+## Setup
+
+### 1. Get a Notion API token
+
+Create an internal integration at [notion.so/profile/integrations](https://www.notion.so/profile/integrations). It needs **Read**, **Update**, and **Insert content** capabilities. You'll get a token starting with `ntn_`.
+
+Then share the pages/databases you want accessible: open each top-level page in Notion, go to **...** → **Connections**, and add your integration. Child pages inherit access.
+
+### 2. Save the token to a file
+
+```bash
+mkdir -p ~/.config/nbjm-mcp
+echo "ntn_YOUR_TOKEN_HERE" > ~/.config/nbjm-mcp/token
+```
+
+### 3. Add to Claude Code
+
+Add this to `~/.claude/settings.json` (or a project `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "nbjm-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "--refresh",
+        "--from",
+        "git+https://github.com/newknew/nbjm-mcp",
+        "nbjm-mcp",
+        "--token-file",
+        "~/.config/nbjm-mcp/token"
+      ]
+    }
+  }
+}
+```
+
+Restart Claude Code. You should see five new tools: `notion_read`, `notion_apply`, `notion_search`, `notion_check_auth`, and `notion_get_url`. Ask Claude to run `notion_check_auth` to verify the connection.
+
+### 3b. Add to Codex (untested)
+
+> **Note:** These instructions have not been tested. If you run into issues, please [open an issue](https://github.com/newknew/nbjm-mcp/issues).
+
+Add this to `~/.codex/config.toml` (or a project-scoped `.codex/config.toml`):
+
+```toml
+[mcp_servers.nbjm-mcp]
+command = "uvx"
+args = [
+  "--refresh",
+  "--from", "git+https://github.com/newknew/nbjm-mcp",
+  "nbjm-mcp",
+  "--token-file", "~/.config/nbjm-mcp/token",
+]
+```
+
+Or use the CLI:
+
+```bash
+codex mcp add nbjm-mcp -- uvx --refresh --from git+https://github.com/newknew/nbjm-mcp nbjm-mcp --token-file ~/.config/nbjm-mcp/token
+```
+
+## Not yet supported
+
+- **Synced blocks** — displayed as placeholder, can't create
+- **Images/video/files** — displayed as `!image` etc.; can't
+  be created via the API
+- **Block equations** — read-only (inline `:eq[expr]` works)
+
+## Changelog
+
+### v0.2.0 — 2026-03-31
+
+- **Flexible update syntax** — `u`/`e` now accepts three forms: quoted (`u ID = "text"`), unquoted (`u ID = text`), and indented (`u ID` with content on the next indented line). Previously only quoted was supported.
+- **Syntax error hints** — when a known command is used with wrong syntax, the error now shows the expected format and an example, instead of reporting it as an unknown command.
+- **Code fence language with spaces** — code blocks now accept multi-word language hints (e.g., `` ```plain text ``), which were previously rejected.
+- **Server version in auth check** — `notion_check_auth` now includes the server version (from pyproject.toml) in its response for easier debugging.
+
+### v0.1.3 — 2026-03-30
+
+- **Null-field stripping on write** — block data returned by the Notion API sometimes contains `null`-valued fields (e.g., `icon: null`). These are now stripped before writing, since the API rejects explicit nulls but accepts absent fields. Fixes errors when cloning or moving certain block types.
+
+### v0.1.2 — 2026-03-29
+
+- **`e` alias for block updates** — `e ID = "text"` is now accepted as an alias for `u`, matching natural "edit" intent.
+- **`help` command** — `script="help"` returns a compact command reference without executing anything.
+- **Smarter unknown-command errors** — unrecognized commands now get fuzzy-matched against valid commands and common natural-language aliases (e.g., `edit` → `u`, `delete` → `x`), with "did you mean?" suggestions.
+- **Explicit `!table N` child rows** — when using `!table N` with indented pipe rows, the rows are now correctly attached as children of the explicit table block instead of being wrapped in a second synthetic table.
+- **Table creation guardrails** — warnings for common mistakes: `@table` (read-only format, not a write command), `!table` without a column count, and pipe rows missing outer pipes.
+- **Typed creation responses** — `+` results now include block types (e.g., `+A1b2(paragraph) +C3d4(to_do)`), with a type summary in the footer.
+- **Parse error suggestions** — error messages now include suggestion text inline, so the fix is visible without inspecting the structured error.
+
+### v0.1.1 — 2026-03-14
+
+- **Equation syntax** — inline equations now use `:eq[expr]` directive instead of `$expr$`. Dollar signs are treated as literal text, so `$50` no longer triggers equation parsing.
+- **Stable move IDs** — moving a block preserves its short ID instead of assigning a new one, so references to moved blocks remain valid.
+- **`+db` response metadata** — `+db` results now include the database short ID and property names (e.g., `+db=7QI8  props: Name, Status, Due`).
+- **`+row` response format** — `+row` results now return created IDs as a list, consistent with other creation commands.
+- **ID registry reassign** — new `reassign()` method on the ID registry supports re-pointing a short ID to a different UUID, used internally by move operations.
+
+### v0.1.0 — 2026-02-20
+
+- **Missing payload diagnostics** — `+row`, `urow`, and `+db` now detect missing or non-indented payloads and produce actionable error messages with autofix suggestions, instead of silently accepting incomplete commands.
+- **Sequential schema execution** — consecutive schema operations (`+prop`, `xprop`, `uprop`) on the same database now execute sequentially to avoid race conditions, using the same chaining mechanism as consecutive moves.
+- **Expanded tool docstrings** — `notion.read` and `notion.apply` docstrings updated with table operations, relative date filter examples, typed refs, and clearer parameter descriptions.
+
+### v0.0.3 — 2026-02-17
+
+- **Database creation and management** — `+db` creates databases with typed property definitions, `+prop` adds properties, `xprop` deletes properties, and `uprop` renames properties. Property definitions use a compact `Name(type: config)` syntax supporting select options, number formats, relation targets, and dual relations.
+- **Full table support** — tables are no longer opaque placeholders. They render as pipe-delimited rows (`| cell | cell |`) with full read/write roundtrip. Consecutive table rows auto-group into a table parent, and Markdown separator rows are silently dropped.
+- **Structural block notation** — column layouts and tables use a new `!type N` notation (`!cols 3`, `!col 1`, `!table 4`) that exposes their structure for editing, replacing the old opaque rendering of columns.
+- **Page positioning** — `+page` now accepts `after=<block_id>` and `pos=start` to control where new pages appear within their parent.
+- **Variable-length code fences** — code blocks now support 3+ backticks, with the closing fence required to match the opening length.
+- **Improved `!`-prefix disambiguation** — callout, opaque, and structural blocks all start with `!` and are now disambiguated in a clear priority order: colored callouts → opaque (`!type~`) → structural (`!type N`) → default callout.
+- **Auto-refresh install** — the recommended `uvx` config now includes `--refresh` so Claude Code always uses the latest version.
+
+### v0.0.2 — 2026-02-14
+
+- **Better searching and filtering over databases** — `notion_read` now accepts `filter`, `sort`, and `columns` parameters. The filter DSL supports comparison operators (`=`, `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=`), unary checks (`?` empty, `!?` not empty), boolean logic (`&`, `|`), parenthesized grouping, quoted property names, and relative dates (`-14d`). Sort takes compact specs like `Due desc, Status asc`. Columns selects which properties to return (`Name, Status, Due`). Schema-aware compilation validates property names and coerces types.
+- **Parallel reads** — each entry in the `pages` list can now override `depth`, `limit`, `filter`, `sort`, and `columns` independently, enabling batch reads that mix pages and filtered databases in a single call.
+- **More block type coverage** — database mentions, `link_mention` (rich URL embeds), `link_preview` (integration embeds), and `template_mention` types are now rendered instead of silently dropped. Annotations (bold, italic, color, etc.) are applied to mention output. Page and row icons (emoji or external URL) are included in NBJM output.
+- **Better move semantics** — moving blocks that contain Notion-hosted files (images, videos, PDFs) now re-uploads the file via the File Upload API to get a permanent reference. Move commands pre-flight check whether a block can be moved, returning clear errors for synced blocks, tables, breadcrumbs, and other non-portable types. Consecutive moves to the same parent execute sequentially with auto-chaining to preserve script order. `m X -> after=Y` without `parent=` now returns a helpful error instead of silently failing.
+- **Renamed MCP config key** — the recommended key in `.mcp.json` / `settings.json` is now `nbjm-mcp` (was `notion-mcp`), to avoid conflicts with other Notion MCP servers.
+
+## License
+
+Apache 2.0

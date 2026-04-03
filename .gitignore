@@ -1,0 +1,10 @@
+.claude/
+.mcp.json
+__pycache__/
+*.egg-info/
+*.py[cod]
+.venv/
+dist/
+build/
+uv.lock
+.DS_Store
