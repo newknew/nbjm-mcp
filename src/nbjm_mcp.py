@@ -6879,7 +6879,7 @@ async def execute_apply_script(
 # MCP Server
 # =============================================================================
 
-mcp = FastMCP("notion-mcp", host="127.0.0.1", port=2052)
+mcp = FastMCP("nbjm", host="127.0.0.1", port=2052)
 
 # Global ID registry (session-scoped in real implementation)
 _id_registry = IdRegistry()
