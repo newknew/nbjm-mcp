@@ -4375,12 +4375,23 @@ def _auto_group_table_rows(blocks: list[NbjmBlock]) -> list[NbjmBlock]:
 
 
 def _parse_row_values(line: str) -> dict[str, str]:
-    """Parse tab-separated col_id=value pairs."""
+    """Parse tab-separated col_id=value pairs.
+
+    Keys and values may be wrapped in double quotes to allow
+    spaces — e.g. `"Last contact"=2026-04-10` or
+    `Status="In Progress"`. Surrounding quotes are stripped.
+    """
+    def _unquote(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            return s[1:-1]
+        return s
+
     values = {}
     for pair in line.split('\t'):
         if '=' in pair:
             key, value = pair.split('=', 1)
-            values[key.strip()] = value.strip()
+            values[_unquote(key)] = _unquote(value)
     return values
 
 
@@ -5772,6 +5783,72 @@ async def execute_apply_op(
             block = await _notion_request_async("GET", f"/blocks/{target_uuid}")
             block_type = block.get("type", "")
             if block_type in ("child_page", "child_database"):
+                # Database rows are also returned as `child_page` blocks,
+                # but their parent.type is `data_source_id` (or
+                # `database_id` on older API versions). For rows, treat
+                # `u` as a synonym for `urow` — parse new_text as
+                # tab-separated key=value property updates rather than
+                # overwriting the row's title.
+                parent = block.get("parent", {})
+                parent_type = parent.get("type", "")
+                if parent_type in ("data_source_id", "database_id"):
+                    row_values = _parse_row_values(op.new_text or "")
+                    if not row_values:
+                        return {}, _error(
+                            "ROW_UPDATE_NO_PAIRS",
+                            f"u on database row {op.target} requires "
+                            f"tab-separated key=value pairs (urow syntax). "
+                            f"Got no parseable pairs in: "
+                            f"{(op.new_text or '')[:80]!r}",
+                            hint='Format: u <rowID>\\n  Status=Done\\t"Last contact"=2026-04-10',
+                        )
+
+                    # Fetch the database schema to validate column names.
+                    if parent_type == "data_source_id":
+                        ds_id = parent.get("data_source_id")
+                        try:
+                            ds_info = await _notion_request_async(
+                                "GET", f"/data_sources/{ds_id}"
+                            )
+                            db_properties = ds_info.get("properties", {})
+                        except httpx.HTTPStatusError as e:
+                            return {}, (
+                                f"Could not fetch row schema: "
+                                f"{_http_error_detail(e, 200)}"
+                            )
+                    else:
+                        db_id = parent.get("database_id")
+                        _, db_properties, schema_err = (
+                            await _fetch_database_schema(db_id)
+                        )
+                        if schema_err:
+                            return {}, schema_err
+
+                    page_props = _build_row_properties(
+                        row_values, db_properties, registry
+                    )
+                    if not page_props:
+                        return {}, _error(
+                            "ROW_UPDATE_NO_MATCH",
+                            f"u on database row {op.target}: none of the "
+                            f"keys {list(row_values.keys())} matched "
+                            f"columns in the database schema.",
+                            hint="Check column names with notion_read on the database.",
+                        )
+
+                    row_uuid = block.get("child_page", {}).get(
+                        "id", target_uuid
+                    )
+                    try:
+                        await _notion_request_async(
+                            "PATCH", f"/pages/{row_uuid}",
+                            json_body={"properties": page_props}
+                        )
+                    except httpx.HTTPStatusError as e:
+                        return {}, f"Row update failed: {_http_error_detail(e)}"
+                    return {"op": "u", "updated": op.target}, None
+
+                # Real page or database — rename its title.
                 page_id = block.get(block_type, {}).get("id", target_uuid)
                 title = op.new_text or ""
                 try:

@@ -37,6 +37,7 @@ from nbjm_mcp import (
     _find_property,
     _notion_request,
     _parse_content_blocks,
+    _parse_row_values,
     _read_impl,
     _reupload_notion_file,
     _text_to_rich_text,
@@ -2004,6 +2005,42 @@ class TestTabIndentation:
         assert result.operations[0].row_values == {"Name": "Test", "Date": "2026-02-01"}
 
 
+class TestParseRowValuesQuoted:
+    """_parse_row_values must strip surrounding double quotes from
+    keys and values so column names with spaces work."""
+
+    def test_quoted_key_with_space(self):
+        """Quoted key like "Last contact" must match the bare column name."""
+        result = _parse_row_values('"Last contact"=2026-04-10')
+        assert result == {"Last contact": "2026-04-10"}
+
+    def test_two_quoted_keys_tab_separated(self):
+        """The exact form from the bug report."""
+        result = _parse_row_values(
+            '"Last contact"=2026-04-10\t"Last platform"=WhatsApp'
+        )
+        assert result == {
+            "Last contact": "2026-04-10",
+            "Last platform": "WhatsApp",
+        }
+
+    def test_quoted_value_with_space(self):
+        """Values may also be quoted to allow spaces."""
+        result = _parse_row_values('Status="In Progress"')
+        assert result == {"Status": "In Progress"}
+
+    def test_unquoted_keys_still_work(self):
+        """Regression: existing unquoted form must keep working."""
+        result = _parse_row_values("Status=Done\tPriority=High")
+        assert result == {"Status": "Done", "Priority": "High"}
+
+    def test_mixed_quoted_and_unquoted(self):
+        result = _parse_row_values(
+            '"Last contact"=2026-04-10\tStatus=Done'
+        )
+        assert result == {"Last contact": "2026-04-10", "Status": "Done"}
+
+
 # =============================================================================
 # Filter DSL Tests
 # =============================================================================
@@ -3638,6 +3675,178 @@ class TestUpdateAutoRoutesForPageBacked:
         patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
         assert len(patch_calls) == 1
         assert "/blocks/" in patch_calls[0][1]
+
+    def test_u_on_database_row_reroutes_to_urow(self, monkeypatch):
+        """u on a child_page whose parent is a database must update
+        row properties (urow semantics), NOT overwrite the row title.
+
+        Regression for bug-reports/2026-04-10T10-52-04-notion-apply-
+        corrupts-titles: 23 contact rows had their Name field
+        overwritten with raw 'key=value' strings.
+        """
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Joss Pecout",
+                                   "id": "row-uuid-1"},
+                    "parent": {"type": "data_source_id",
+                               "data_source_id": "ds-uuid-1"},
+                }
+            if method == "GET" and "/data_sources/" in endpoint:
+                return {
+                    "properties": {
+                        "Name": {"type": "title"},
+                        "Last contact": {"type": "date"},
+                        "Last platform": {"type": "select"},
+                    }
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "row-uuid-1"}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["crD4"] = "row-uuid-1"
+        registry._uuid_to_short["row-uuid-1"] = "crD4"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="crD4",
+            new_text='"Last contact"=2026-04-10\t'
+                     '"Last platform"=WhatsApp',
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None, f"unexpected error: {err}"
+        assert result["op"] == "u"
+        assert result["updated"] == "crD4"
+
+        # Exactly one PATCH, against /pages/{row}, with properties only.
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        method, endpoint, body = patch_calls[0]
+        assert "/pages/row-uuid-1" in endpoint
+        assert "properties" in body
+        # Critical: title MUST NOT appear in the PATCH body.
+        assert "title" not in body["properties"]
+        assert "Name" not in body["properties"]
+        # The intended fields ARE present.
+        assert "Last contact" in body["properties"]
+        assert body["properties"]["Last contact"]["date"]["start"] \
+            == "2026-04-10"
+        assert "Last platform" in body["properties"]
+        assert body["properties"]["Last platform"]["select"]["name"] \
+            == "WhatsApp"
+
+    def test_u_on_database_row_with_no_valid_pairs_errors(
+        self, monkeypatch
+    ):
+        """When new_text on a row has no parseable key=value pairs,
+        return an error rather than silently corrupting the title."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Some Row",
+                                   "id": "row-uuid-2"},
+                    "parent": {"type": "data_source_id",
+                               "data_source_id": "ds-uuid-2"},
+                }
+            if method == "GET" and "/data_sources/" in endpoint:
+                return {
+                    "properties": {
+                        "Name": {"type": "title"},
+                        "Status": {"type": "select"},
+                    }
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Row2"] = "row-uuid-2"
+        registry._uuid_to_short["row-uuid-2"] = "Row2"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Row2",
+            new_text="just some free text with no equals signs",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        # No PATCH issued — title is safe.
+        assert not any(c[0] == "PATCH" for c in patched_calls)
+
+    def test_u_on_database_row_with_legacy_database_id_parent(
+        self, monkeypatch
+    ):
+        """Older Notion API uses parent.type == 'database_id'
+        instead of 'data_source_id'. Both must be detected as rows."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Legacy Row",
+                                   "id": "row-uuid-3"},
+                    "parent": {"type": "database_id",
+                               "database_id": "db-uuid-3"},
+                }
+            if method == "GET" and endpoint == "/databases/db-uuid-3":
+                return {"data_sources": [{"id": "ds-uuid-3"}]}
+            if method == "GET" and "/data_sources/" in endpoint:
+                return {
+                    "properties": {
+                        "Name": {"type": "title"},
+                        "Status": {"type": "select"},
+                    }
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "row-uuid-3"}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Row3"] = "row-uuid-3"
+        registry._uuid_to_short["row-uuid-3"] = "Row3"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Row3",
+            new_text="Status=Done",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None, f"unexpected error: {err}"
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        body = patch_calls[0][2]
+        assert "title" not in body["properties"]
+        assert body["properties"]["Status"]["select"]["name"] == "Done"
 
 
 # =============================================================================
