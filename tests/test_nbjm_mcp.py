@@ -3960,6 +3960,266 @@ class TestUpdateAutoRoutesForPageBacked:
         assert body["properties"]["Status"]["select"]["name"] == "Done"
 
 
+class TestNotionReadDispatchFallthrough:
+    """notion_read must fall through to /blocks/{id} when both
+    /pages/{id} and /databases/{id} fail with a 4xx error.
+
+    Regression for:
+    - bug-reports/2026-04-10T08-23-08-notion-read-toggle-block
+    - bug-reports/2026-04-11T07-07-31-notion-read-short-id-fails
+
+    Previously the database-step error handler only caught 404,
+    so a 400 validation_error ("Provided database_id ...") from
+    /databases/ short-circuited before reaching the /blocks/ try.
+    """
+
+    @staticmethod
+    def _http_error(status_code: int, message: str = ""):
+        """Build an httpx.HTTPStatusError with a given status code."""
+        import httpx
+        request = httpx.Request("GET", "https://api.notion.com/")
+        response = httpx.Response(
+            status_code=status_code,
+            request=request,
+            content=message.encode() if message else b"",
+        )
+        return httpx.HTTPStatusError(
+            f"HTTP {status_code}",
+            request=request,
+            response=response,
+        )
+
+    def test_block_ref_falls_through_to_blocks_endpoint(
+        self, monkeypatch
+    ):
+        """When /pages/ and /databases/ both 400, /blocks/ must
+        be tried and render successfully."""
+        import nbjm_mcp
+
+        calls = []
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            calls.append((method, endpoint))
+            if endpoint.startswith("/pages/"):
+                raise self._http_error(
+                    400,
+                    '{"code":"validation_error",'
+                    '"message":"Provided page_id is not valid"}'
+                )
+            if endpoint.startswith("/databases/"):
+                raise self._http_error(
+                    400,
+                    '{"code":"validation_error",'
+                    '"message":"Provided database_id 33eb94fa-24..."}'
+                )
+            if endpoint.startswith("/blocks/") and endpoint.endswith(
+                "/children"
+            ):
+                return {"results": [], "has_more": False}
+            if endpoint.startswith("/blocks/"):
+                return {
+                    "id": "11111111-2222-3333-4444-555555555555",
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": {"content": "A toggle block"},
+                            "plain_text": "A toggle block",
+                            "annotations": {
+                                "bold": False, "italic": False,
+                                "strikethrough": False, "underline": False,
+                                "code": False, "color": "default",
+                            },
+                        }]
+                    },
+                    "has_children": False,
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        # Seed the registry so the short ID resolves.
+        nbjm_mcp._id_registry._short_to_uuid["VW5I"] = (
+            "11111111-2222-3333-4444-555555555555"
+        )
+        nbjm_mcp._id_registry._uuid_to_short[
+            "11111111-2222-3333-4444-555555555555"
+        ] = "VW5I"
+
+        result = asyncio.run(
+            nbjm_mcp._read_impl(
+                "VW5I", "edit", depth=10, limit=50
+            )
+        )
+
+        # Must not return an HTTP_ERROR — the block path was reached.
+        assert "HTTP_ERROR" not in result
+        assert "error:" not in result.lower() or "@nbjm" in result
+        # The content was rendered.
+        assert "A toggle block" in result
+
+        # Dispatch chain was: /pages/ → /databases/ → /blocks/
+        called_endpoints = [c[1] for c in calls]
+        assert any(e.startswith("/pages/") for e in called_endpoints)
+        assert any(e.startswith("/databases/") for e in called_endpoints)
+        assert any(e.startswith("/blocks/") for e in called_endpoints)
+
+    def test_block_ref_with_children_renders_tree(
+        self, monkeypatch
+    ):
+        """When a block has children, /blocks/{id}/children must
+        also be fetched and included in the output."""
+        import nbjm_mcp
+
+        calls = []
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            calls.append((method, endpoint))
+            if endpoint.startswith("/pages/"):
+                raise self._http_error(400, "not a page")
+            if endpoint.startswith("/databases/"):
+                raise self._http_error(
+                    400,
+                    '{"message":"Provided database_id..."}'
+                )
+            # Bare block GET (parent toggle)
+            if (endpoint.startswith("/blocks/")
+                    and not endpoint.endswith("/children")):
+                return {
+                    "id": "22222222-3333-4444-5555-666666666666",
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": {"content": "Parent toggle"},
+                            "plain_text": "Parent toggle",
+                            "annotations": {
+                                "bold": False, "italic": False,
+                                "strikethrough": False, "underline": False,
+                                "code": False, "color": "default",
+                            },
+                        }]
+                    },
+                    "has_children": True,
+                }
+            # Children fetch
+            if endpoint.endswith("/children"):
+                return {
+                    "results": [{
+                        "id": "33333333-4444-5555-6666-777777777777",
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {
+                            "rich_text": [{
+                                "type": "text",
+                                "text": {"content": "Child bullet"},
+                                "plain_text": "Child bullet",
+                                "annotations": {
+                                    "bold": False, "italic": False,
+                                    "strikethrough": False,
+                                    "underline": False, "code": False,
+                                    "color": "default",
+                                },
+                            }]
+                        },
+                        "has_children": False,
+                    }],
+                    "has_more": False,
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        nbjm_mcp._id_registry._short_to_uuid["iI0q"] = (
+            "22222222-3333-4444-5555-666666666666"
+        )
+        nbjm_mcp._id_registry._uuid_to_short[
+            "22222222-3333-4444-5555-666666666666"
+        ] = "iI0q"
+
+        result = asyncio.run(
+            nbjm_mcp._read_impl(
+                "iI0q", "edit", depth=10, limit=50
+            )
+        )
+
+        assert "HTTP_ERROR" not in result
+        assert "Parent toggle" in result
+        assert "Child bullet" in result
+
+    def test_database_400_with_non_db_msg_tries_block_not_http_error(
+        self, monkeypatch
+    ):
+        """The exact bug scenario: /databases/ returns 400 with
+        'Provided database_id ...' — must fall through to block
+        instead of returning HTTP_ERROR.
+        """
+        import nbjm_mcp
+
+        call_count = {"blocks": 0}
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            if endpoint.startswith("/pages/"):
+                raise self._http_error(400, "not a page")
+            if endpoint.startswith("/databases/"):
+                raise self._http_error(
+                    400,
+                    '{"object":"error","status":400,'
+                    '"code":"validation_error",'
+                    '"message":"Provided database_id 33fb94fa-24..."}'
+                )
+            if endpoint.startswith("/blocks/") and endpoint.endswith(
+                "/children"
+            ):
+                return {"results": [], "has_more": False}
+            if endpoint.startswith("/blocks/"):
+                call_count["blocks"] += 1
+                return {
+                    "id": "44444444-5555-6666-7777-888888888888",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [{
+                            "type": "text",
+                            "text": {"content": "Some bullet"},
+                            "plain_text": "Some bullet",
+                            "annotations": {
+                                "bold": False, "italic": False,
+                                "strikethrough": False, "underline": False,
+                                "code": False, "color": "default",
+                            },
+                        }]
+                    },
+                    "has_children": False,
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        nbjm_mcp._id_registry._short_to_uuid["OG8b"] = (
+            "44444444-5555-6666-7777-888888888888"
+        )
+        nbjm_mcp._id_registry._uuid_to_short[
+            "44444444-5555-6666-7777-888888888888"
+        ] = "OG8b"
+
+        result = asyncio.run(
+            nbjm_mcp._read_impl(
+                "OG8b", "view", depth=10, limit=50
+            )
+        )
+
+        # Bug was: result contained HTTP_ERROR.
+        assert "HTTP_ERROR" not in result
+        # Block path was actually reached.
+        assert call_count["blocks"] >= 1
+        assert "Some bullet" in result
+
+
 class TestDatabaseRenameAndMove:
     """upage / u / m / mpage on Notion databases.
 

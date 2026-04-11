@@ -7222,8 +7222,11 @@ async def _read_impl(
 
     except httpx.HTTPStatusError as e:
         if e.response is not None:
-            if e.response.status_code == 404:
-                # Not a page or database - try as a block
+            if e.response.status_code in (404, 400):
+                # Not a page or database — try as a block. 400 is the
+                # Notion response shape for "Provided database_id is
+                # not valid" when the UUID actually refers to a block.
+                # Falling through to /blocks/{id} handles that case.
                 if has_db_params:
                     return _error(
                         "DB_PARAMS_ON_PAGE",
