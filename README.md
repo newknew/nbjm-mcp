@@ -111,6 +111,18 @@ codex mcp add nbjm-mcp -- uvx --refresh --from git+https://github.com/newknew/nb
 
 ## Changelog
 
+### v0.3.0 — 2026-04-11
+
+- **`@b:shortID` block mentions** — inline references to specific blocks now parse and render as links to the block's Notion URL. Works in paragraphs, bullets, and table cells (the original scenario where the bug was reported — table cells use the same parse pipeline as everything else, so fixing `@b:` at the parser level fixes tables for free). Also supports `[custom text](b:shortID)` explicit link syntax.
+- **`u <rowID>` as a synonym for `urow`** — calling `u` on a database row now auto-routes to row-property update semantics (parse the tab-separated `key=value` payload, match columns, PATCH the row). Previously `u` on a row silently overwrote the Name/title with the raw payload string, quietly corrupting contact records and similar databases across many sessions.
+- **Quoted keys in row updates** — `"Last contact"=2026-04-10\t"Last platform"=WhatsApp` (the natural form when column names have spaces) now parses correctly. Surrounding double quotes are stripped from both keys and values. Previously keys kept their literal quotes and never matched any column, making the update a silent no-op.
+- **Database rename via `upage` / `u`** — `upage <dbID> = "New Name" icon=📚` and `u <dbShortID> = "New Name"` now correctly `PATCH /databases/{id}` with the Notion databases API's top-level `title` rich_text shape. Previously both routed to `/pages/{id}` and returned 404 for database UUIDs.
+- **Clean refusal for database moves** — `m` or `mpage` on a database now returns `DB_MOVE_UNSUPPORTED` with a pointer to the Notion UI. The Notion API has no way to move databases programmatically; previously callers hit the move endpoint and got a raw validation error.
+- **`notion_read` dispatch for block-level refs** — reading a block short ID (toggle, bullet, heading) now correctly falls through `/pages/` → `/databases/` → `/blocks/` on 400 responses, not just 404. Previously Notion's "Provided database_id..." validation error short-circuited with `HTTP_ERROR`, forcing agents to re-read entire parent pages to verify a single child.
+- **`cpage` surfaces the new page short ID** — copy operations now return the new page's short ID in the apply result (`+SHORT_ID`), so follow-up ops like `mpage <copyID> -> parent=<originalID>` have a target. Previously `cpage` returned just `ok`, making the copy unreachable in the same batch.
+- **Pipe rows missing outer pipes warn** — content like `Camp | For | Ages` (intended as a table row but missing the leading/trailing pipes) now emits a warning explaining why it became a paragraph instead of a table. Joins the existing `@table` and bare-`!table` guardrail warnings.
+- **All apply-script parse errors surface** — submitting multiple invalid commands in one script now reports one error per bad line. Previously `execute_apply_script` grabbed `parse_result.errors[0]` and silently dropped the rest, hiding anything past the first mistake.
+
 ### v0.2.0 — 2026-03-31
 
 - **Flexible update syntax** — `u`/`e` now accepts three forms: quoted (`u ID = "text"`), unquoted (`u ID = text`), and indented (`u ID` with content on the next indented line). Previously only quoted was supported.

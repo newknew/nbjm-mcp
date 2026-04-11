@@ -7653,16 +7653,16 @@ async def notion_apply(
         [link text](https://url)
         :eq[x^2 + y^2]           (equation)
         @user:uuid-here          (user mention)
-        @date:2025-01-15         (date mention)
-        @date:2025-01-14→2025-01-16  (date range)
-        @p:shortID               (page @mention - PREFERRED)
-        [custom text](p:shortID) (link to page with custom text)
+        @date:2025-01-15         (date mention, range: →)
+        @p:shortID               (page @mention — PREFERRED)
+        @b:shortID               (block link — PREFERRED for blocks)
+        [text](p:shortID)        (page link with custom text)
+        [text](b:shortID)        (block link with custom text)
 
-    Page References:
-        @p:shortID - Creates a Notion @mention showing the page's actual title.
-                     Title updates automatically if page is renamed. PREFERRED.
-        [text](p:shortID) - Creates a hyperlink with YOUR custom text.
-                            Use when you need specific link text.
+    `@p:` and `@b:` are the canonical Notion style for referring to
+    pages and blocks — almost always use these. Only fall back to
+    `[text](p:...)` or `[text](b:...)` when the user specifically
+    asks for custom display text.
 
     Escape: \\n (newline) \\t (tab) \\\\ (backslash) \\" (quote)
     Escape block markers: \\# Not a heading  \\- Not a bullet
@@ -7676,6 +7676,11 @@ async def notion_apply(
         xpage ID
         upage ID [= "New Title"] [icon=📝] [cover=URL]
         cpage ID -> parent=ID [title="Copy Title"]
+
+        `upage` and `u` also work on databases (child_database
+        blocks) — rename and re-icon via the databases API.
+        Databases cannot be moved via API; `m`/`mpage` on a
+        database refuse cleanly.
 
     Database Schema Commands:
         +db parent=ID title="DB Name" [icon=📊]
@@ -7706,6 +7711,10 @@ async def notion_apply(
         urow ID
           Status=Done	Priority=High
         xrow ID
+
+        `u <rowID>` is accepted as a synonym for `urow` — same
+        tab-separated key=value payload. Quote column names with
+        spaces: `u I9j0\n  "Last contact"=2026-04-10\tStatus=Done`.
 
     Row Value Types:
         Title/Text: Name=My Task

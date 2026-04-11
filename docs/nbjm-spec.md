@@ -257,6 +257,8 @@ Arrows need escaping only at line start or in `[link](url)` text:
 | `[text](url)` | link | |
 | `@p:A1b2` | page @mention | **USE THIS** |
 | `[text](p:A1b2)` | page link | Custom text only |
+| `@b:A1b2` | block link | Inline link to specific block |
+| `[text](b:A1b2)` | block link | Custom text variant |
 | `@user:UUID` | user mention | Full Notion user UUID |
 | `@date:2024-01-15` | date mention | ISO format |
 | `@date:2024-01-15→2024-01-20` | date range | Start→End |
@@ -276,6 +278,33 @@ See @p:A1b2 for details.
 # AVOID - custom text can become stale
 See [the docs](p:A1b2) for details.
 ```
+
+### Block References
+
+`@b:shortID` creates a link to a specific block (paragraph, bullet,
+toggle, heading, etc.) rather than a whole page. Like `@p:`, this
+is the canonical Notion style — use `@b:` and reserve
+`[text](b:shortID)` for cases where the user explicitly asks for
+custom display text.
+
+Unlike `@p:`, Notion's rich_text API has no first-class `block`
+mention type, so `@b:` is emitted as a text span whose URL points
+at the block's Notion URL. Display text is the short ID itself
+(legible fallback).
+
+```
+# GOOD — canonical Notion style
+See @b:A1b2 for the reasoning.
+
+# AVOID unless asked for — custom text goes stale
+See [the Montreux thread](b:A1b2) for details.
+```
+
+Block references work in every context that goes through the inline
+parser: paragraphs, bullets, headings, callouts, toggle labels, and
+table cells. Fetch the block short IDs from a prior `notion_read` —
+short IDs are session-scoped, so cached IDs from earlier sessions
+will not resolve.
 
 ### Inline Equations
 
@@ -562,6 +591,21 @@ cpage SOURCE -> parent=TARGET
 cpage SOURCE -> parent=TARGET title="Custom Title"
 ```
 
+**Databases**: `upage` and `u` auto-detect when the target is a
+`child_database` block and dispatch to the Notion databases API
+(`PATCH /databases/{id}` with a top-level `title` rich_text array)
+instead of the pages API (which 404s on database UUIDs). Both of
+these rename an inline database:
+
+```
+upage DbId = "Renamed DB" icon=📚
+u DbId = "Renamed DB"
+```
+
+`m` and `mpage` on a database refuse cleanly with
+`DB_MOVE_UNSUPPORTED` — the Notion API does not support moving
+databases programmatically. Move manually in the Notion UI.
+
 **Copy limitations**: Only pages can be copied. Databases, synced blocks,
 and certain embedded content cannot be deep-copied. See error codes below.
 
@@ -583,6 +627,25 @@ urow I9j0
 # Delete row
 xrow K1l2
 ```
+
+**`u` on a database row**: `u <rowID>` is accepted as a synonym for
+`urow` — same tab-separated `key=value` payload, same column
+matching, same PATCH. The row's Name/title is preserved unless
+explicitly named in the payload. This exists because `u` is the
+natural generalization across block types (`u` on a paragraph
+updates text, `u` on a `child_page` renames the page, `u` on a
+row updates row properties).
+
+```
+u I9j0
+  Status=Done	"Last contact"=2026-04-10
+```
+
+**Quoted keys**: column names containing spaces should be quoted,
+e.g. `"Last contact"=2026-04-10`. Surrounding double quotes on
+both keys and values are stripped before schema matching. Missing
+the quotes on a spaced column name results in a no-op because the
+key fails to match any column.
 
 **Returns:** Compact multiline string (0-indexed line numbers):
 ```
@@ -705,7 +768,9 @@ if you need sequential dependency between operations.
 | `COPY_SYNCED_BLOCK` | Cannot copy synced blocks | No |
 | `COPY_CONTAINS_UNSUPPORTED` | Page contains uncopyable content | No |
 | `INVALID_COVER_URL` | Cover must be external URL | No |
-| `MOVE_DATABASE` | Cannot move databases via API | No |
+| `DB_MOVE_UNSUPPORTED` | Cannot move databases via API | No |
+| `ROW_UPDATE_NO_PAIRS` | `u <rowID>` with no parseable `k=v` pairs | Yes |
+| `ROW_UPDATE_NO_MATCH` | No row-update keys match db schema columns | Yes |
 | `CREATE_DATABASE` | Cannot create child DBs via API | No |
 | `CONFLICT_DETECTED` | Same block targeted by multiple ops | No |
 
