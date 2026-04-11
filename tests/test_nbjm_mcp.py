@@ -52,6 +52,7 @@ from nbjm_mcp import (
     compile_filter,
     nbjm_block_to_notion,
     execute_apply_op,
+    execute_apply_script,
     extract_uuid_from_url,
     fetch_database_async,
     fetch_data_source_async,
@@ -1676,6 +1677,61 @@ class TestApplyScriptErrorPropagation:
         assert err.line == 5
         # Verify line_num doesn't exist (to prevent regression)
         assert not hasattr(err, 'line_num')
+
+    def test_parse_errors_all_surface_from_multi_line_script(self):
+        """parse_apply_script must emit ONE error per invalid line,
+        not stop at the first. Regression for integration-test-
+        playground Test 47 batched form: submitting 5 unknown
+        commands in one script produced only 1 error."""
+        script = (
+            'edit A1b2 = "text"\n'
+            'delete A1b2\n'
+            'move A1b2 -> parent=B2c3\n'
+            'add parent=A1b2\n'
+            'remove A1b2'
+        )
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+
+        # All 5 lines must produce parse errors.
+        assert len(result.errors) == 5
+        attempted_tokens = [
+            e.message.split("'")[1] for e in result.errors
+            if "'" in e.message
+        ]
+        assert "edit" in attempted_tokens
+        assert "delete" in attempted_tokens
+        assert "move" in attempted_tokens
+        assert "add" in attempted_tokens
+        assert "remove" in attempted_tokens
+
+    def test_execute_script_surfaces_all_parse_errors(self):
+        """execute_apply_script must surface ALL parse errors as
+        separate line results, not just errors[0]. Previously the
+        handler grabbed `parse_result.errors[0]` and returned a
+        single-result list, swallowing any additional errors."""
+        script = (
+            'edit A1b2 = "text"\n'
+            'delete A1b2\n'
+            'move A1b2 -> parent=B2c3'
+        )
+        registry = IdRegistry()
+        result = asyncio.run(
+            execute_apply_script(script, registry, dry_run=True)
+        )
+
+        # All 3 errors must appear as distinct line results.
+        assert not result.ok
+        assert len(result.results) == 3
+        # Each result is a failure with the correct attempted command.
+        errors_joined = " | ".join(
+            r.error or "" for r in result.results
+        )
+        assert "'edit'" in errors_joined
+        assert "'delete'" in errors_joined
+        assert "'move'" in errors_joined
+        # Line numbers ascend (one per input line).
+        assert [r.line for r in result.results] == [0, 1, 2]
 
     def test_valid_after_parameter_still_works(self):
         """Valid after=BLOCK_ID still parses correctly."""

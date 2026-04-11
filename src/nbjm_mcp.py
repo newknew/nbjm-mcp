@@ -6890,20 +6890,21 @@ async def execute_apply_script(
     parse_result = parse_apply_script(script, registry)
 
     if parse_result.errors:
-        # Return parse error as a line result (include suggestions)
-        err = parse_result.errors[0]
-        error_msg = err.message
-        if err.suggestions:
-            error_msg += ". " + "; ".join(err.suggestions)
-        return ApplyResult(
-            ok=False,
-            results=[ApplyLineResult(
+        # Return ALL parse errors as separate line results so multiple
+        # issues in one script (e.g. 5 unknown commands) are all
+        # surfaced to the caller, not just the first one.
+        line_results: list[ApplyLineResult] = []
+        for err in parse_result.errors:
+            error_msg = err.message
+            if err.suggestions:
+                error_msg += ". " + "; ".join(err.suggestions)
+            line_results.append(ApplyLineResult(
                 line=err.line,
                 ok=False,
                 op="parse",
-                error=error_msg
-            )]
-        )
+                error=error_msg,
+            ))
+        return ApplyResult(ok=False, results=line_results)
 
     # Detect conflicts before execution (same ID targeted by multiple ops)
     conflicts = _detect_conflicts(parse_result.operations)
