@@ -6432,7 +6432,15 @@ async def execute_apply_op(
                     # Failed to copy children - page still created
                     pass
 
-            result: dict = {"op": "cpage", "copied": new_short_id, "from": op.source}
+            # Return shape uses `created` (matching +page) so the
+            # apply result formatter at line ~7031 picks it up and
+            # surfaces the new short ID as `+SHORT_ID` in the output.
+            # `from` is preserved for context.
+            result: dict = {
+                "op": "cpage",
+                "created": [new_short_id] if new_short_id else [],
+                "from": op.source,
+            }
             if copy_warnings:
                 result["warnings"] = copy_warnings
             return result, None

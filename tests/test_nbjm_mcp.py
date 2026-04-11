@@ -4413,6 +4413,85 @@ class TestDatabaseRenameAndMove:
         )
 
 
+class TestCopyPageReturnShape:
+    """cpage must return the new page's short ID under `created`,
+    matching the +page convention so the result formatter surfaces
+    it. Previously cpage used `copied` which the formatter ignores —
+    the new page was created but the apply response said only `ok`
+    with no `+SHORT_ID`, leaving callers unable to reference the copy
+    for follow-up ops like `mpage <copyID> -> parent=...`.
+
+    Surfaced during live test of integration test playground Test 13
+    (Page Commands), 2026-04-11.
+    """
+
+    def test_cpage_result_includes_created_with_new_short_id(
+        self, monkeypatch
+    ):
+        """The execute_apply_op result for COPY_PAGE must contain
+        `created` with the new short ID — not `copied`."""
+        import nbjm_mcp
+
+        src_uuid = "11111111-1111-1111-1111-111111111111"
+        dest_uuid = "22222222-2222-2222-2222-222222222222"
+        copy_uuid = "33333333-3333-3333-3333-333333333333"
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            if method == "GET" and endpoint.startswith("/pages/"):
+                return {
+                    "id": src_uuid,
+                    "properties": {
+                        "title": {
+                            "type": "title",
+                            "title": [{
+                                "type": "text",
+                                "text": {"content": "Source Page"},
+                                "plain_text": "Source Page",
+                            }],
+                        },
+                    },
+                }
+            if method == "POST" and endpoint == "/pages":
+                return {"id": copy_uuid}
+            if method == "GET" and endpoint.endswith("/children"):
+                return {"results": [], "has_more": False}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["SRC1"] = src_uuid
+        registry._uuid_to_short[src_uuid] = "SRC1"
+        registry._short_to_uuid["DST1"] = dest_uuid
+        registry._uuid_to_short[dest_uuid] = "DST1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.COPY_PAGE,
+            source="SRC1",
+            dest_parent="DST1",
+            title="Copied Page",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None, f"unexpected error: {err}"
+        # Must use `created` (matching +page), not `copied`.
+        assert "created" in result
+        created = result["created"]
+        # Should be a list (matching +page convention) so the
+        # formatter at _read_impl line ~7031 picks it up.
+        if isinstance(created, str):
+            created = [created]
+        assert len(created) == 1
+        # The new short ID for the copied page must be present and
+        # registered in the registry.
+        new_short_id = created[0]
+        assert new_short_id
+        assert registry.resolve(new_short_id) == copy_uuid
+
+
 # =============================================================================
 # Table and ! Prefix Tests
 # =============================================================================
