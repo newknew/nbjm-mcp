@@ -5848,7 +5848,30 @@ async def execute_apply_op(
                         return {}, f"Row update failed: {_http_error_detail(e)}"
                     return {"op": "u", "updated": op.target}, None
 
-                # Real page or database — rename its title.
+                # Real database — rename via the Databases API.
+                # Notion's Pages API returns 404 for database UUIDs;
+                # databases have a distinct endpoint and a top-level
+                # `title` rich_text array (not `properties.title`).
+                if block_type == "child_database":
+                    db_id = block.get("child_database", {}).get(
+                        "id", target_uuid
+                    )
+                    title = op.new_text or ""
+                    try:
+                        await _notion_request_async(
+                            "PATCH", f"/databases/{db_id}",
+                            json_body={
+                                "title": _text_to_rich_text(title, registry)
+                            }
+                        )
+                    except httpx.HTTPStatusError as e:
+                        return {}, (
+                            f"Database title update failed: "
+                            f"{_http_error_detail(e)}"
+                        )
+                    return {"op": "u", "updated": op.target}, None
+
+                # Real page — rename its title via the Pages API.
                 page_id = block.get(block_type, {}).get("id", target_uuid)
                 title = op.new_text or ""
                 try:
@@ -5911,8 +5934,18 @@ async def execute_apply_op(
             if move_error:
                 return {}, move_error
 
+            # Databases cannot be moved via the Notion API.
+            if source_type == "child_database":
+                return {}, _error(
+                    "DB_MOVE_UNSUPPORTED",
+                    f"m {op.source}: cannot move a database. The "
+                    f"Notion API does not support moving databases "
+                    f"programmatically.",
+                    hint="Move the database manually in the Notion UI.",
+                )
+
             # Check if it's a page-backed block (use page move instead)
-            if source_type in ("child_page", "child_database"):
+            if source_type == "child_page":
                 # Page move - ID doesn't change
                 # Get the page ID from the block
                 page_id = source_block.get(source_type, {}).get("id", source_uuid)
@@ -6156,21 +6189,43 @@ async def execute_apply_op(
             return {"op": "+page", "created": created_ids}, None
 
         elif op.command == ApplyCommand.UPDATE_PAGE:
-            # Update page properties (title, icon, cover)
+            # Update page or database properties (title, icon, cover).
+            # Databases have a distinct endpoint and a different body
+            # shape for title — GET the block first to dispatch.
             target_id = _remap_id(op.target, id_map)
             page_uuid, err = _resolve_or_error(registry, target_id, "page")
             if err:
                 return {}, err
 
+            is_database = False
+            try:
+                block_info = await _notion_request_async(
+                    "GET", f"/blocks/{page_uuid}"
+                )
+                if block_info.get("type") == "child_database":
+                    is_database = True
+            except httpx.HTTPStatusError:
+                # If we can't fetch block info, fall back to page path.
+                pass
+
             update_body: dict = {}
 
             # Update title if provided
             if op.title is not None:
-                update_body["properties"] = {
-                    "title": {"title": _text_to_rich_text(op.title, registry)}
-                }
+                if is_database:
+                    # Databases: top-level `title` rich_text array
+                    update_body["title"] = _text_to_rich_text(
+                        op.title, registry
+                    )
+                else:
+                    # Pages: nested properties.title.title
+                    update_body["properties"] = {
+                        "title": {
+                            "title": _text_to_rich_text(op.title, registry)
+                        }
+                    }
 
-            # Update icon if provided
+            # Update icon if provided (same format for pages and databases)
             if op.icon:
                 if op.icon == "none":
                     update_body["icon"] = None
@@ -6189,10 +6244,17 @@ async def execute_apply_op(
             if not update_body:
                 return {}, "upage: nothing to update (provide title, icon, or cover)"
 
+            endpoint = (
+                f"/databases/{page_uuid}" if is_database
+                else f"/pages/{page_uuid}"
+            )
             try:
-                await _notion_request_async("PATCH", f"/pages/{page_uuid}", json_body=update_body)
+                await _notion_request_async(
+                    "PATCH", endpoint, json_body=update_body
+                )
             except httpx.HTTPStatusError as e:
-                return {}, f"Page update failed: {_http_error_detail(e)}"
+                kind = "Database" if is_database else "Page"
+                return {}, f"{kind} update failed: {_http_error_detail(e)}"
 
             return {"op": "upage", "updated": op.target}, None
 
@@ -6207,6 +6269,23 @@ async def execute_apply_op(
             dest_uuid, err = _resolve_or_error(registry, dest_id, "destination")
             if err:
                 return {}, err
+
+            # Databases cannot be moved via the Notion API — detect
+            # upfront and return a clear error before hitting /pages/.
+            try:
+                block_info = await _notion_request_async(
+                    "GET", f"/blocks/{page_uuid}"
+                )
+                if block_info.get("type") == "child_database":
+                    return {}, _error(
+                        "DB_MOVE_UNSUPPORTED",
+                        f"mpage {op.source}: cannot move a database. "
+                        f"The Notion API does not support moving "
+                        f"databases programmatically.",
+                        hint="Move the database manually in the Notion UI.",
+                    )
+            except httpx.HTTPStatusError:
+                pass  # Can't check — let the POST surface the error
 
             try:
                 await _notion_request_async(

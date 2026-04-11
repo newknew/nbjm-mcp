@@ -3602,8 +3602,17 @@ class TestUpdateAutoRoutesForPageBacked:
         title_rt = patched_calls[1][2]["properties"]["title"]["title"]
         assert title_rt[0]["text"]["content"] == "New Title"
 
-    def test_u_on_child_database_updates_title(self, monkeypatch):
-        """u on a ⊞ block should PATCH the page title."""
+    def test_u_on_child_database_renames_via_databases_endpoint(
+        self, monkeypatch
+    ):
+        """u on a ⊞ (child_database) block must PATCH /databases/{id},
+        NOT /pages/{id}. The Notion Pages API returns 404 for database
+        UUIDs — databases have their own endpoint with a different
+        request body shape (top-level `title` rich_text array).
+
+        Regression for bug-reports/2026-04-04T08-27-22-database-rename-
+        move-unsupported.
+        """
         import nbjm_mcp
 
         patched_calls = []
@@ -3613,13 +3622,14 @@ class TestUpdateAutoRoutesForPageBacked:
             if method == "GET" and "/blocks/" in endpoint:
                 return {
                     "type": "child_database",
-                    "child_database": {"title": "Old DB", "id": "db-uuid-9999"},
+                    "child_database": {"title": "Old DB"},
                 }
-            if method == "PATCH" and "/pages/" in endpoint:
-                return {"id": "db-uuid-9999"}
+            if method == "PATCH" and "/databases/" in endpoint:
+                return {"id": "block-uuid-aaaa"}
             return {}
 
-        monkeypatch.setattr(nbjm_mcp, "_notion_request_async", mock_request)
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
 
         registry = IdRegistry()
         registry._short_to_uuid["B2c3"] = "block-uuid-aaaa"
@@ -3633,10 +3643,21 @@ class TestUpdateAutoRoutesForPageBacked:
         )
         result, err = asyncio.run(execute_apply_op(op, registry))
 
-        assert err is None
+        assert err is None, f"unexpected error: {err}"
         assert result["op"] == "u"
-        assert patched_calls[1][0] == "PATCH"
-        assert "/pages/db-uuid-9999" in patched_calls[1][1]
+
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        method, endpoint, body = patch_calls[0]
+        # Must hit /databases/, not /pages/
+        assert "/databases/block-uuid-aaaa" in endpoint
+        assert "/pages/" not in endpoint
+        # Body uses top-level `title` rich_text array (not
+        # `properties.title.title` which is the pages-API shape).
+        assert "title" in body
+        assert "properties" not in body
+        assert isinstance(body["title"], list)
+        assert body["title"][0]["text"]["content"] == "Renamed Database"
 
     def test_u_on_regular_block_still_works(self, monkeypatch):
         """u on a paragraph block should NOT take the page-title path."""
@@ -3847,6 +3868,199 @@ class TestUpdateAutoRoutesForPageBacked:
         body = patch_calls[0][2]
         assert "title" not in body["properties"]
         assert body["properties"]["Status"]["select"]["name"] == "Done"
+
+
+class TestDatabaseRenameAndMove:
+    """upage / u / m / mpage on Notion databases.
+
+    Regression for bug-reports/2026-04-04T08-27-22-database-rename-
+    move-unsupported. The Notion API has a distinct `/databases/{id}`
+    endpoint — database UUIDs are NOT valid page UUIDs, so PATCHing
+    /pages/ returns 404. Moving a database is not supported by the
+    API at all; the tool must return a clear error.
+    """
+
+    def test_upage_on_database_patches_databases_endpoint(
+        self, monkeypatch
+    ):
+        """upage with title+icon on a child_database block must
+        PATCH /databases/{id}, not /pages/{id}."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Old DB Title"},
+                }
+            if method == "PATCH" and "/databases/" in endpoint:
+                return {"id": "db-uuid-1"}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["DbId"] = "db-uuid-1"
+        registry._uuid_to_short["db-uuid-1"] = "DbId"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE_PAGE,
+            target="DbId",
+            title="Bay School Payments",
+            icon="🏫",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None, f"unexpected error: {err}"
+        assert result["op"] == "upage"
+        assert result["updated"] == "DbId"
+
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        method, endpoint, body = patch_calls[0]
+        assert "/databases/db-uuid-1" in endpoint
+        assert "/pages/" not in endpoint
+
+        # Database title uses top-level `title` rich_text array.
+        assert "title" in body
+        assert "properties" not in body
+        assert isinstance(body["title"], list)
+        assert body["title"][0]["text"]["content"] == "Bay School Payments"
+        # Icon works the same as on pages.
+        assert body["icon"] == {"type": "emoji", "emoji": "🏫"}
+
+    def test_upage_on_regular_page_still_patches_pages(
+        self, monkeypatch
+    ):
+        """Regression: upage on a real page (not a database) must
+        still hit /pages/{id} with the properties.title shape."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Old Page"},
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "page-uuid-1"}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["PgId"] = "page-uuid-1"
+        registry._uuid_to_short["page-uuid-1"] = "PgId"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE_PAGE,
+            target="PgId",
+            title="Renamed Page",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        method, endpoint, body = patch_calls[0]
+        assert "/pages/page-uuid-1" in endpoint
+        assert "/databases/" not in endpoint
+        # Pages API: properties.title.title = [...]
+        assert "properties" in body
+        assert body["properties"]["title"]["title"][0]["text"]["content"] \
+            == "Renamed Page"
+
+    def test_m_on_child_database_returns_clear_error(
+        self, monkeypatch
+    ):
+        """m <dbShortID> -> parent=... must refuse with a clear
+        error — Notion API cannot move databases."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Some DB"},
+                    "parent": {"type": "page_id", "page_id": "old-parent"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["DbId"] = "db-uuid-2"
+        registry._uuid_to_short["db-uuid-2"] = "DbId"
+        registry._short_to_uuid["Dst1"] = "dest-uuid"
+        registry._uuid_to_short["dest-uuid"] = "Dst1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.MOVE,
+            source="DbId",
+            dest_parent="Dst1",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert "database" in err.lower()
+        # No move API call was issued.
+        assert not any(
+            c[0] == "POST" and "/move" in c[1] for c in patched_calls
+        )
+
+    def test_mpage_on_database_returns_clear_error(self, monkeypatch):
+        """mpage <dbID> -> parent=... must refuse with a clear error."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Some DB"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["DbId"] = "db-uuid-3"
+        registry._uuid_to_short["db-uuid-3"] = "DbId"
+        registry._short_to_uuid["Dst1"] = "dest-uuid-3"
+        registry._uuid_to_short["dest-uuid-3"] = "Dst1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.MOVE_PAGE,
+            source="DbId",
+            dest_parent="Dst1",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert "database" in err.lower()
+        # No /pages/{id}/move call was issued.
+        assert not any(
+            c[0] == "POST" and "/move" in c[1] for c in patched_calls
+        )
 
 
 # =============================================================================
