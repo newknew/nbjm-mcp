@@ -1075,6 +1075,29 @@ class TestParseInlineFormatting:
         assert spans[1].page_id == "A1b2"
         assert spans[2].text == " for details"
 
+    def test_block_mention_syntax(self):
+        """@b:shortID creates a block mention span.
+
+        Regression for bug-reports/2026-04-09T19-30-23-table-block-
+        refs-broken: `@b:` was completely unimplemented and rendered
+        as literal text in every context (bullets, paragraphs, table
+        cells).
+        """
+        spans = parse_inline_formatting("See @b:ECSF below")
+        assert len(spans) == 3
+        assert spans[0].text == "See "
+        assert spans[1].span_type == "mention_block"
+        assert spans[1].block_id == "ECSF"
+        assert spans[2].text == " below"
+
+    def test_block_mention_full_uuid(self):
+        """@b: accepts a full UUID as well as a short ID."""
+        uuid = "12345678-1234-1234-1234-123456789abc"
+        spans = parse_inline_formatting(f"ref @b:{uuid}")
+        assert len(spans) == 2
+        assert spans[1].span_type == "mention_block"
+        assert spans[1].block_id == uuid
+
     def test_color_red(self):
         spans = parse_inline_formatting(":red[warning]")
         assert len(spans) == 1
@@ -1381,6 +1404,73 @@ class TestRichTextSpansToNotion:
         assert result[0]["text"]["content"] == "my page"
         # UUID dashes removed for URL format
         assert result[0]["text"]["link"]["url"] == "https://notion.so/12345678123412341234123456789abc"
+
+    def test_block_mention_renders_as_linked_short_id(self):
+        """mention_block renders as a text span with a link to the
+        block's Notion URL. Display text = the short ID so the cell
+        is legible even before the link resolves.
+
+        Notion's API has no first-class `block` mention rich_text
+        type, so we emit a regular text+link span.
+        """
+        registry = IdRegistry()
+        full_uuid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        short_id = registry.register(full_uuid)
+
+        spans = [RichTextSpan(
+            text="",
+            span_type="mention_block",
+            block_id=short_id,
+        )]
+        result = rich_text_spans_to_notion(spans, registry=registry)
+
+        assert len(result) == 1
+        assert result[0]["type"] == "text"
+        # Display text: short ID (legible fallback)
+        assert result[0]["text"]["content"] == short_id
+        # Link: Notion URL for the block (UUID without dashes)
+        assert result[0]["text"]["link"]["url"] \
+            == f"https://notion.so/{full_uuid.replace('-', '')}"
+
+    def test_block_link_syntax_resolves_to_notion_url(self):
+        """[custom text](b:shortID) should also create a link
+        with a Notion URL for the block."""
+        registry = IdRegistry()
+        full_uuid = "abcd1234-5678-90ab-cdef-1234567890ab"
+        short_id = registry.register(full_uuid)
+
+        spans = [RichTextSpan(
+            text="BARNES item", link=f"b:{short_id}"
+        )]
+        result = rich_text_spans_to_notion(spans, registry=registry)
+        assert result[0]["type"] == "text"
+        assert result[0]["text"]["content"] == "BARNES item"
+        assert result[0]["text"]["link"]["url"] \
+            == f"https://notion.so/{full_uuid.replace('-', '')}"
+
+    def test_block_mention_in_table_cell_end_to_end(self):
+        """End-to-end: @b:shortID inside a table cell renders as a
+        linked span, not literal text. This is the exact scenario
+        from bug-reports/2026-04-09T19-30-23-table-block-refs-broken.
+        """
+        registry = IdRegistry()
+        full_uuid = "aaaabbbb-cccc-dddd-eeee-ffff00001111"
+        short_id = registry.register(full_uuid)
+
+        # Simulate the parse pipeline used by table cells at
+        # src/nbjm_mcp.py:4532 (table_row block → parse cells →
+        # parse_inline_formatting → rich_text_spans_to_notion).
+        cell_text = f"@b:{short_id}"
+        spans = parse_inline_formatting(cell_text)
+        rt = rich_text_spans_to_notion(spans, registry=registry)
+
+        # Must NOT be literal text.
+        assert len(rt) == 1
+        assert rt[0]["type"] == "text"
+        assert rt[0]["text"]["content"] != f"@b:{short_id}"
+        # Must be a clickable link to the block.
+        assert rt[0]["text"]["link"]["url"] \
+            == f"https://notion.so/{full_uuid.replace('-', '')}"
 
     def test_page_link_without_registry_uses_ref_directly(self):
         """[text](p:ref) without registry uses ref directly in URL."""

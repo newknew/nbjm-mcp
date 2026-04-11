@@ -774,9 +774,10 @@ class RichTextSpan:
     color: Optional[str] = None
     link: Optional[str] = None
     # For special spans
-    span_type: str = "text"  # text, mention_user, mention_date, mention_page, equation
+    span_type: str = "text"  # text, mention_user, mention_date, mention_page, mention_block, equation
     user_id: Optional[str] = None
     page_id: Optional[str] = None  # For page mentions (p:shortID)
+    block_id: Optional[str] = None  # For block mentions (b:shortID)
     date: Optional[str] = None
     end_date: Optional[str] = None
     expression: Optional[str] = None
@@ -897,6 +898,15 @@ def _make_inline_parser():
         P.regex(r'[A-Za-z0-9-]+')
     ).map(lambda pid: RichTextSpan(text='', span_type='mention_page', page_id=pid))
 
+    # Block mention: @b:shortID or @b:full-uuid
+    # Notion has no first-class `block` mention in rich_text, so we
+    # render this as a text span with a link to the block's Notion
+    # URL. See rich_text_spans_to_notion for the emission path.
+    mention_block = (
+        P.string('@b:') >>
+        P.regex(r'[A-Za-z0-9-]+')
+    ).map(lambda bid: RichTextSpan(text='', span_type='mention_block', block_id=bid))
+
     # Code: `text` (no nesting allowed)
     code = (
         P.string('`') >>
@@ -985,6 +995,7 @@ def _make_inline_parser():
         mention_user |      # @user:UUID
         mention_date |      # @date:YYYY-MM-DD
         mention_page |      # @p:shortID (page @mention)
+        mention_block |     # @b:shortID (block link)
         code |              # `...`
         bold |              # **...**
         strikethrough |     # ~~...~~ (before italic to avoid ** vs * issues)
@@ -1253,6 +1264,35 @@ def rich_text_spans_to_notion(
                     "type": "text",
                     "text": {"content": span.text}
                 })
+        elif span.span_type == 'mention_block':
+            # Notion has no first-class `block` mention in rich_text.
+            # Emit a text span with the block's Notion URL as a link.
+            # Display text = the short ID (legible fallback).
+            block_uuid = None
+            if registry and span.block_id:
+                block_uuid = registry.resolve(span.block_id)
+            if not block_uuid and span.block_id:
+                # Might already be a full UUID
+                block_uuid = span.block_id
+            if block_uuid:
+                result.append({
+                    "type": "text",
+                    "text": {
+                        "content": span.block_id,
+                        "link": {
+                            "url": (
+                                f"https://notion.so/"
+                                f"{block_uuid.replace('-', '')}"
+                            )
+                        },
+                    },
+                })
+            else:
+                # Can't resolve — fall back to literal text
+                result.append({
+                    "type": "text",
+                    "text": {"content": f"@b:{span.block_id or ''}"},
+                })
         else:
             obj: dict = {
                 "type": "text",
@@ -1262,17 +1302,19 @@ def rich_text_spans_to_notion(
             # Add link if present
             if span.link:
                 url = span.link
-                # Resolve p:shortID to full Notion URL
-                if url.startswith('p:'):
-                    page_ref = url[2:]
-                    page_uuid = None
+                # Resolve p:shortID / b:shortID to full Notion URL.
+                # Both prefixes use the same URL format — the registry
+                # resolves any short ID (page OR block) to its UUID.
+                if url.startswith('p:') or url.startswith('b:'):
+                    ref = url[2:]
+                    uuid = None
                     if registry:
-                        page_uuid = registry.resolve(page_ref)
-                    if not page_uuid:
+                        uuid = registry.resolve(ref)
+                    if not uuid:
                         # Try using as-is (might be full UUID)
-                        page_uuid = page_ref
+                        uuid = ref
                     # Convert to Notion URL (remove dashes for URL format)
-                    url = f"https://notion.so/{page_uuid.replace('-', '')}"
+                    url = f"https://notion.so/{uuid.replace('-', '')}"
                 obj["text"]["link"] = {"url": url}
 
             # Add annotations if any are non-default
