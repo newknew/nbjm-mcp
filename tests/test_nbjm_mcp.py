@@ -672,6 +672,52 @@ class TestParseContentBlocksWarnings:
         assert len(op.content_blocks[1].warnings) == 1
         assert "looks like nested delimiters" in op.content_blocks[1].warnings[0]
 
+    def test_pipe_separated_without_outer_pipes_warns(self):
+        """Content like `Camp | For | Ages` (multiple pipes, no
+        outer pipes) looks like a table row that's missing its
+        outer pipes. Should produce a warning so the user knows
+        why it became a paragraph instead of a table.
+
+        Regression for integration test playground Test 49c —
+        previously the only table guardrail warnings were for
+        @table and !table-without-count; pipe rows without outer
+        pipes silently became paragraphs.
+        """
+        lines = ["Camp | For | Ages"]
+        blocks = _parse_content_blocks(lines, [], 1)
+        assert len(blocks) == 1
+        assert blocks[0].block_type == "paragraph"
+        assert blocks[0].content == "Camp | For | Ages"
+        # Must produce a warning mentioning outer pipes / table.
+        assert len(blocks[0].warnings) >= 1
+        warning = blocks[0].warnings[0].lower()
+        assert "pipe" in warning or "table" in warning
+
+    def test_pipe_with_only_one_separator_does_not_warn(self):
+        """`On | Off` and similar single-pipe text should NOT
+        warn — too easy to false-positive on legitimate text
+        that happens to use a pipe as a separator."""
+        lines = ["On | Off"]
+        blocks = _parse_content_blocks(lines, [], 1)
+        assert len(blocks) == 1
+        assert blocks[0].block_type == "paragraph"
+        # No table-related warning.
+        for w in blocks[0].warnings:
+            assert "pipe" not in w.lower()
+            assert "table" not in w.lower()
+
+    def test_proper_table_row_does_not_warn(self):
+        """A correctly-formatted pipe row `| A | B | C |` is
+        a real table row and must not trigger the missing-outer-
+        pipes warning. Auto-grouping wraps lone pipe rows in a
+        synthetic `table` block, so the block type is `table`."""
+        lines = ["| A | B | C |"]
+        blocks = _parse_content_blocks(lines, [], 1)
+        assert len(blocks) == 1
+        assert blocks[0].block_type in ("table", "table_row")
+        for w in blocks[0].warnings:
+            assert "outer pipe" not in w.lower()
+
 
 class TestParseNbjm:
     """Tests for parse_nbjm function."""

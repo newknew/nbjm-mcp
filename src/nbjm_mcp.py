@@ -606,6 +606,19 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
             "!table requires a column count (e.g. !table 6). Without it, this "
             "becomes a plain paragraph. Use !table N or consecutive | col | col | rows."
         )
+    # (g) Warn if content has 2+ pipes but is missing outer pipes
+    # — strong signal of an intended table row that won't auto-group
+    # (e.g. `Camp | For | Ages` instead of `| Camp | For | Ages |`).
+    # Single-pipe text like `On | Off` is left alone to avoid
+    # false-positives on legitimate prose.
+    elif (content.count('|') >= 2
+          and not content.startswith('|')
+          and not content.endswith('|')):
+        warnings.append(
+            "pipe-separated content without outer pipes — looks like "
+            "a table row, but won't auto-group into a table. To create "
+            "a table, wrap each row in pipes: | col | col | col |"
+        )
 
     # Default: paragraph
     return 'paragraph', content, {}, warnings
