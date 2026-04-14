@@ -1959,6 +1959,57 @@ class TestBuildPropertyValue:
         result = _build_property_value("unknown_type", "value")
         assert result is None
 
+    def test_relation_with_full_uuid(self):
+        """Relation property accepts a full UUID with dashes."""
+        uuid = "301b94fa-2460-8180-b8e5-c7afe18072fe"
+        result = _build_property_value("relation", uuid)
+        assert result == {"relation": [{"id": uuid}]}
+
+    def test_relation_with_dashless_uuid(self):
+        """Relation property normalizes a UUID without dashes."""
+        dashless = "301b94fa24608180b8e5c7afe18072fe"
+        result = _build_property_value("relation", dashless)
+        assert result == {
+            "relation": [{"id": "301b94fa-2460-8180-b8e5-c7afe18072fe"}]
+        }
+
+    def test_relation_with_short_id(self):
+        """Relation property resolves short IDs via the registry."""
+        registry = IdRegistry()
+        uuid = "301b94fa-2460-8180-b8e5-c7afe18072fe"
+        short_id = registry.register(uuid)
+        result = _build_property_value(
+            "relation", short_id, registry=registry
+        )
+        assert result == {"relation": [{"id": uuid}]}
+
+    def test_relation_multi_comma_separated(self):
+        """Multiple targets are comma-separated (mirrors multi_select
+        and matches how users naturally type a list of page refs)."""
+        registry = IdRegistry()
+        uuid1 = "11111111-1111-1111-1111-111111111111"
+        uuid2 = "22222222-2222-2222-2222-222222222222"
+        sid1 = registry.register(uuid1)
+        sid2 = registry.register(uuid2)
+        result = _build_property_value(
+            "relation", f"{sid1}, {sid2}", registry=registry
+        )
+        assert result == {
+            "relation": [{"id": uuid1}, {"id": uuid2}]
+        }
+
+    def test_relation_empty_value_returns_none(self):
+        """Empty relation string → None (no refs to write)."""
+        assert _build_property_value("relation", "") is None
+        assert _build_property_value("relation", "   ") is None
+
+    def test_relation_unresolvable_ref_returns_none(self):
+        """If no ref in the value can be resolved, the result is
+        None so _build_row_properties reports it as unresolved."""
+        # No registry, and the value isn't a valid UUID.
+        result = _build_property_value("relation", "not-a-valid-ref")
+        assert result is None
+
 
 class TestBuildRowProperties:
     """Tests for _build_row_properties helper function."""
@@ -1972,45 +2023,72 @@ class TestBuildRowProperties:
             "Name": {"type": "title"},
             "Status": {"type": "select"}
         }
-        result = _build_row_properties(row_values, db_props)
-        assert result == {
+        props, unresolved = _build_row_properties(row_values, db_props)
+        assert props == {
             "Name": {"title": [{"type": "text", "text": {"content": "Task 1"}}]},
             "Status": {"select": {"name": "Done"}}
         }
+        assert unresolved == []
 
     def test_case_insensitive_property_lookup(self):
         row_values = {"name": "Task"}  # lowercase
         db_props = {"Name": {"type": "title"}}  # Capitalized
-        result = _build_row_properties(row_values, db_props)
-        assert "Name" in result  # Uses canonical name from db_props
+        props, unresolved = _build_row_properties(row_values, db_props)
+        assert "Name" in props  # Uses canonical name from db_props
+        assert unresolved == []
 
     def test_trailing_whitespace_property_lookup(self):
         """Notion property names may have trailing spaces; NBJM input is stripped."""
         row_values = {"Paid on": "2026-01-19"}  # No trailing space (stripped by parser)
         db_props = {"Paid on ": {"type": "date"}}  # Trailing space in Notion
-        result = _build_row_properties(row_values, db_props)
-        assert "Paid on " in result  # Uses canonical name from db_props (with space)
+        props, unresolved = _build_row_properties(row_values, db_props)
+        assert "Paid on " in props  # Uses canonical name from db_props (with space)
+        assert unresolved == []
 
-    def test_skips_unknown_properties(self):
+    def test_unknown_properties_reported_as_unresolved(self):
+        """Unknown column names no longer silently skip — they're
+        reported in the unresolved list so callers can surface a
+        clear error instead of producing an empty PATCH.
+
+        Regression for bug-reports/2026-04-14T17-20-05-relation-
+        update-silently-fails: `urow` with an unbuildable value
+        returned `No valid properties to update` with no hint
+        about which column or value was the problem.
+        """
         row_values = {"Name": "Task", "Unknown": "Value"}
         db_props = {"Name": {"type": "title"}}
-        result = _build_row_properties(row_values, db_props)
-        assert "Name" in result
-        assert "Unknown" not in result
+        props, unresolved = _build_row_properties(row_values, db_props)
+        assert "Name" in props
+        assert "Unknown" not in props
+        assert len(unresolved) == 1
+        assert "Unknown" in unresolved[0]
 
-    def test_skips_invalid_number_conversion(self):
+    def test_invalid_number_conversion_reported_as_unresolved(self):
+        """A value that can't be coerced into the column's type
+        (e.g. non-numeric string for a number column) is reported
+        in unresolved, not silently dropped."""
         row_values = {"Count": "not a number"}
         db_props = {"Count": {"type": "number"}}
-        result = _build_row_properties(row_values, db_props)
-        assert "Count" not in result  # Invalid conversion returns None
+        props, unresolved = _build_row_properties(row_values, db_props)
+        assert "Count" not in props
+        assert len(unresolved) == 1
+        assert "Count" in unresolved[0]
 
     def test_empty_row_values(self):
-        result = _build_row_properties({}, {"Name": {"type": "title"}})
-        assert result == {}
+        props, unresolved = _build_row_properties(
+            {}, {"Name": {"type": "title"}}
+        )
+        assert props == {}
+        assert unresolved == []
 
     def test_empty_db_properties(self):
-        result = _build_row_properties({"Name": "Value"}, {})
-        assert result == {}
+        props, unresolved = _build_row_properties(
+            {"Name": "Value"}, {}
+        )
+        assert props == {}
+        # Empty schema means every input key is unknown.
+        assert len(unresolved) == 1
+        assert "Name" in unresolved[0]
 
 
 # =============================================================================
@@ -4060,6 +4138,119 @@ class TestUpdateAutoRoutesForPageBacked:
         body = patch_calls[0][2]
         assert "title" not in body["properties"]
         assert body["properties"]["Status"]["select"]["name"] == "Done"
+
+    def test_u_on_database_row_writes_relation_property(
+        self, monkeypatch
+    ):
+        """u <rowID> with a relation column value must include
+        `{"relation": [{"id": uuid}]}` in the PATCH body.
+
+        Regression for bug-reports/2026-04-14T17-20-05-relation-
+        update-silently-fails: relation property writes used to
+        be silently dropped because `_build_property_value` had
+        no case for `relation` and returned None, which the row
+        builder skipped.
+        """
+        import nbjm_mcp
+
+        patched_calls = []
+        amanda_uuid = "301b94fa-2460-8180-b8e5-c7afe18072fe"
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Amanda meeting"},
+                    "parent": {"type": "data_source_id",
+                               "data_source_id": "ds-uuid-x"},
+                }
+            if method == "GET" and "/data_sources/" in endpoint:
+                return {
+                    "properties": {
+                        "Name": {"type": "title"},
+                        "Who": {"type": "relation"},
+                    }
+                }
+            if method == "PATCH" and "/pages/" in endpoint:
+                return {"id": "row-uuid-x"}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Row9"] = "row-uuid-x"
+        registry._uuid_to_short["row-uuid-x"] = "Row9"
+        registry._short_to_uuid["N2jf"] = amanda_uuid
+        registry._uuid_to_short[amanda_uuid] = "N2jf"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Row9",
+            new_text="Who=N2jf",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is None, f"unexpected error: {err}"
+        patch_calls = [c for c in patched_calls if c[0] == "PATCH"]
+        assert len(patch_calls) == 1
+        body = patch_calls[0][2]
+        assert body["properties"]["Who"] == {
+            "relation": [{"id": amanda_uuid}]
+        }
+
+    def test_u_on_database_row_unknown_column_errors(
+        self, monkeypatch
+    ):
+        """u <rowID> with a column that doesn't exist in the
+        schema must return an error listing available columns,
+        not silently skip the update."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None,
+                               params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Some Row"},
+                    "parent": {"type": "data_source_id",
+                               "data_source_id": "ds-uuid-y"},
+                }
+            if method == "GET" and "/data_sources/" in endpoint:
+                return {
+                    "properties": {
+                        "Name": {"type": "title"},
+                        "Status": {"type": "select"},
+                    }
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Row7"] = "row-uuid-y"
+        registry._uuid_to_short["row-uuid-y"] = "Row7"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Row7",
+            new_text="BogusCol=anything",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        # Error should name the bad column and list available ones.
+        assert "BogusCol" in err
+        # No PATCH was issued.
+        assert not any(c[0] == "PATCH" for c in patched_calls)
 
 
 class TestNotionReadDispatchFallthrough:

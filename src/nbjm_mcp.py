@@ -5605,6 +5605,25 @@ def _build_property_value(
         return {"email": value}
     elif prop_type == "phone_number":
         return {"phone_number": value}
+    elif prop_type == "relation":
+        # Comma-separated list of page refs. Each ref can be a
+        # short ID (resolved via registry), a full UUID with
+        # dashes, or a UUID without dashes. Unresolvable refs
+        # are skipped; if ALL refs fail the property is None
+        # so the caller can report it as unresolved.
+        refs = [r.strip() for r in value.split(",") if r.strip()]
+        items: list[dict] = []
+        for ref in refs:
+            page_uuid = registry.resolve(ref) if registry else None
+            if not page_uuid:
+                try:
+                    page_uuid = normalize_uuid(ref)
+                except ValueError:
+                    continue
+            items.append({"id": page_uuid})
+        if not items:
+            return None
+        return {"relation": items}
     return None
 
 
@@ -5612,7 +5631,7 @@ def _build_row_properties(
     row_values: dict[str, str],
     db_properties: dict,
     registry: Optional['IdRegistry'] = None
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], list[str]]:
     """Build Notion page properties from NBJM row values.
 
     Handles case-insensitive property name matching, and tolerates
@@ -5624,9 +5643,22 @@ def _build_row_properties(
         registry: Optional ID registry for resolving @mentions in text fields
 
     Returns:
-        Dict of property_name -> Notion property value
+        Tuple `(page_props, unresolved)`:
+
+        - `page_props` maps property name → Notion property value
+          for every input key that matched a schema column AND
+          built into a valid Notion value.
+
+        - `unresolved` is a list of human-readable descriptions
+          of input keys that could NOT be applied (either because
+          the column name didn't match the schema, or because
+          the value couldn't be converted to the column's type).
+          Callers should surface these to the user rather than
+          silently dropping them — silent drops let real bugs
+          like missing `relation` support go unnoticed for months.
     """
     page_props: dict = {}
+    unresolved: list[str] = []
     for col_name, value in row_values.items():
         # Find the property definition
         prop_def = db_properties.get(col_name)
@@ -5641,14 +5673,25 @@ def _build_row_properties(
                     break
 
         if not prop_def:
-            continue  # Skip unknown properties
+            available = ", ".join(sorted(db_properties.keys())) or "(none)"
+            unresolved.append(
+                f"unknown column {col_name!r} "
+                f"(available: {available})"
+            )
+            continue
 
         prop_type = prop_def.get("type")
         prop_value = _build_property_value(prop_type, value, registry)
-        if prop_value is not None:
-            page_props[col_name] = prop_value
+        if prop_value is None:
+            unresolved.append(
+                f"column {col_name!r} ({prop_type}): "
+                f"value {value!r} couldn't be converted"
+            )
+            continue
 
-    return page_props
+        page_props[col_name] = prop_value
+
+    return page_props, unresolved
 
 
 async def _fetch_database_schema(
@@ -5879,16 +5922,18 @@ async def execute_apply_op(
                         if schema_err:
                             return {}, schema_err
 
-                    page_props = _build_row_properties(
+                    page_props, unresolved = _build_row_properties(
                         row_values, db_properties, registry
                     )
-                    if not page_props:
+                    # If ANY input key didn't apply, bail with a
+                    # clear per-key explanation — silently dropping
+                    # props is how relation writes went unnoticed.
+                    if unresolved:
                         return {}, _error(
                             "ROW_UPDATE_NO_MATCH",
-                            f"u on database row {op.target}: none of the "
-                            f"keys {list(row_values.keys())} matched "
-                            f"columns in the database schema.",
-                            hint="Check column names with notion_read on the database.",
+                            f"u on database row {op.target}: "
+                            + "; ".join(unresolved),
+                            hint="Check column names and value formats with notion_read on the database.",
                         )
 
                     row_uuid = block.get("child_page", {}).get(
@@ -6074,7 +6119,15 @@ async def execute_apply_op(
             db_properties = db_info.get("properties", {})
 
             # Build page properties
-            page_props = _build_row_properties(op.row_values, db_properties, registry)
+            page_props, unresolved = _build_row_properties(
+                op.row_values, db_properties, registry
+            )
+            if unresolved:
+                return {}, _error(
+                    "ROW_UPDATE_NO_MATCH",
+                    f"+row db={op.database}: " + "; ".join(unresolved),
+                    hint="Check column names and value formats with notion_read on the database.",
+                )
 
             # Build page body
             # IMPORTANT: parent.database_id must be the database CONTAINER ID,
@@ -6131,10 +6184,17 @@ async def execute_apply_op(
                 return {}, schema_err
 
             # Build property updates
-            page_props = _build_row_properties(op.row_values, db_properties, registry)
-
+            page_props, unresolved = _build_row_properties(
+                op.row_values, db_properties, registry
+            )
+            if unresolved:
+                return {}, _error(
+                    "ROW_UPDATE_NO_MATCH",
+                    f"urow {op.target}: " + "; ".join(unresolved),
+                    hint="Check column names and value formats with notion_read on the database.",
+                )
             if not page_props:
-                return {}, f"No valid properties to update"
+                return {}, f"urow {op.target}: no properties to update"
 
             # Update the page
             try:
@@ -7726,6 +7786,8 @@ async def notion_apply(
         Date range: Period=2025-01-01→2025-01-31
         URL: Link=https://example.com
         Email: Contact=user@example.com
+        Relation: Who=PageShortID   (or full UUID)
+                  Tags=Ref1,Ref2    (multi-target, comma-separated)
 
     Returns:
         Compact multiline string with per-line results (0-indexed):

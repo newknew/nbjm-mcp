@@ -1,6 +1,6 @@
 [project]
 name = "nbjm-mcp"
-version = "0.3.0"
+version = "0.4.0"
 description = "Token-efficient MCP server for Notion using NBJM (Notion Is Basically Just Markdown)"
 readme = "README.md"
 license = "Apache-2.0"

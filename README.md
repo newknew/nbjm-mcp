@@ -111,6 +111,11 @@ codex mcp add nbjm-mcp -- uvx --refresh --from git+https://github.com/newknew/nb
 
 ## Changelog
 
+### v0.4.0 — 2026-04-14
+
+- **Relation property writes** — `+row`, `urow`, and `u <rowID>` now write to `relation` columns. Values are comma-separated page references (short ID, dashed UUID, or dashless UUID); a single relation is `Who=N2jf`, multi-target is `Tags=N2jf, R4kQ`. Previously `_build_property_value` had no case for `"relation"` and returned `None`, so the row builder silently skipped relation columns — `+row ... Who=N2jf` reported `ok` but the relation was empty, and `urow` / `u` returned `No valid properties to update` even when a valid relation was in the payload.
+- **No more silent drops in row-property builds** — `_build_row_properties` now returns `(props, unresolved)`, where `unresolved` lists every input key that didn't apply (unknown column, or value that couldn't be converted for the column's type). `+row`, `urow`, and `u <rowID>` all surface `ROW_UPDATE_NO_MATCH` with a per-key explanation (e.g. `unknown column 'Who' (available: Date, Name)` or `column 'Count' (number): value 'x' couldn't be converted`). This makes failures like the relation-write bug impossible to miss — previously the relation-missing bug went unnoticed across many sessions because the error was hidden behind a generic "No valid properties to update" message.
+
 ### v0.3.0 — 2026-04-11
 
 - **`@b:shortID` block mentions** — inline references to specific blocks now parse and render as links to the block's Notion URL. Works in paragraphs, bullets, and table cells (the original scenario where the bug was reported — table cells use the same parse pipeline as everything else, so fixing `@b:` at the parser level fixes tables for free). Also supports `[custom text](b:shortID)` explicit link syntax.

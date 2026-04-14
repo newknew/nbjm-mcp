@@ -647,6 +647,25 @@ both keys and values are stripped before schema matching. Missing
 the quotes on a spaced column name results in a no-op because the
 key fails to match any column.
 
+**Relation values**: write to a `relation` column with a
+comma-separated list of page references. Each ref can be a short
+ID (resolved via the session registry), a full UUID with dashes,
+or a UUID without dashes:
+
+```
+urow I9j0
+  Who=N2jf
+  Tags=N2jf, R4kQ, 11111111-2222-3333-4444-555555555555
+```
+
+**No silent drops**: every input key must either match a schema
+column AND build into a valid Notion value, or `+row` / `urow` /
+`u` returns `ROW_UPDATE_NO_MATCH` listing exactly which keys
+failed and why (unknown column → lists available; bad value →
+shows the type and rejected value). Previously unknown columns
+and unbuildable values were silently skipped, which let real
+bugs (like missing relation support) hide for months.
+
 **Returns:** Compact multiline string (0-indexed line numbers):
 ```
 0: +Z1a2 +Z3b4    (created IDs)
