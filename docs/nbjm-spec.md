@@ -684,6 +684,45 @@ The `→` shows old→new mapping for subsequent operations.
 
 ---
 
+## Title Safety
+
+A misplaced row-update payload landing in a title column is a
+footgun that silently corrupts records. Before any code path sets
+a page, row, or database title, the proposed value goes through
+a bright-line check. The value is rejected with `SUSPICIOUS_TITLE`
+if **either** of these is true:
+
+1. **Contains a literal tab character** — tabs are the DSL's
+   column separator for row updates. `Name="Last contact=2026-04-10
+   \tLast platform=WhatsApp"` is almost always someone who meant
+   to call `urow` on multiple fields and mis-targeted the title.
+
+2. **Starts with a capitalized `Key=Value` shape** — matches
+   values like `Last contact=2026-04-10`, `Status=Done`,
+   `Name=Alex`. Real titles rarely begin with a capitalized
+   phrase followed immediately by `=`.
+
+The check applies at every title-setting site:
+
+| Command | Title source |
+|:---|:---|
+| `+page title="…"` | `title=` argument |
+| `+db title="…"` | `title=` argument |
+| `+row db=X\n  Name=…` | `Name` column value |
+| `urow ID\n  Name=…` | `Name` column value |
+| `u <rowID>\n  Name=…` | `Name` column value |
+| `u <pageID> = "…"` | quoted new-text |
+| `u <dbID> = "…"` | quoted new-text |
+| `upage ID = "…"` | `= "…"` argument |
+| `cpage SRC -> parent=X title="…"` | `title=` argument |
+
+The error includes the triggering value, the rule that fired,
+and a concrete `urow` rewrite suggestion. If a legitimate title
+happens to match one of the rules, rephrase without the embedded
+tab or leading `Key=` shape.
+
+---
+
 ## Insertion Limitations
 
 Notion's Append Block Children endpoint:
@@ -790,6 +829,7 @@ if you need sequential dependency between operations.
 | `DB_MOVE_UNSUPPORTED` | Cannot move databases via API | No |
 | `ROW_UPDATE_NO_PAIRS` | `u <rowID>` with no parseable `k=v` pairs | Yes |
 | `ROW_UPDATE_NO_MATCH` | No row-update keys match db schema columns | Yes |
+| `SUSPICIOUS_TITLE` | Title value looks like a misplaced row update | Yes |
 | `CREATE_DATABASE` | Cannot create child DBs via API | No |
 | `CONFLICT_DETECTED` | Same block targeted by multiple ops | No |
 

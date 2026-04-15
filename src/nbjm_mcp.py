@@ -5560,6 +5560,67 @@ def _remap_id(short_id: Optional[str], id_map: dict[str, str]) -> Optional[str]:
     return id_map.get(short_id, short_id)
 
 
+# Regex: a capitalized word (or multi-word phrase), immediately
+# followed by `=` and a non-space value. Matches things like
+# "Last contact=2026-04-10", "Name=Alex", "Status=Done" — the
+# classic shape of a row-update payload. Does NOT match "Budget
+# = $50" (space around `=`), "2+2=4" (non-letter start), or any
+# lowercase-leading string — too many real titles use those.
+_KEY_EQUALS_TITLE_RE = re.compile(r'^[A-Z][A-Za-z]+(\s[A-Za-z]+)*=\S')
+
+
+def _validate_title_value(value: str) -> Optional[str]:
+    """Decide whether a proposed title value looks like a
+    misplaced row-update payload.
+
+    This is the central defense against the bug class that
+    corrupted contact rows with titles like
+    `Last contact=2026-04-10\\tLast platform=WhatsApp`. Every
+    code path that sets a page, row, or database title runs
+    its input through this function and refuses if it returns
+    a non-None message.
+
+    Two bright-line checks:
+
+    1. Tab character: the DSL uses tab as the row-update column
+       separator (`Col1=val1\\tCol2=val2`). A title containing
+       an unescaped tab is almost certainly an update payload
+       in the wrong place.
+
+    2. Leading `CapitalizedKey=Value` shape: titles of that
+       shape are overwhelmingly misplaced updates rather than
+       real titles. A few legitimate titles could match (e.g.
+       "Design=Done"), but the false-positive rate is low and
+       the error message explains how to rephrase.
+
+    Returns `None` if the value is safe, else a descriptive
+    error suitable for surfacing to the user.
+    """
+    if not value:
+        return None
+    if '\t' in value:
+        return (
+            f"title value contains a tab character — refusing to "
+            f"set (tabs are column separators in row updates). If "
+            f"you meant to update multiple fields, use "
+            f"`urow <ID>\\n  Col1=val1\\tCol2=val2`. If this really "
+            f"is the title you want, rephrase without the embedded "
+            f"tab."
+        )
+    if _KEY_EQUALS_TITLE_RE.match(value):
+        preview = value[:60] + ("…" if len(value) > 60 else "")
+        return (
+            f"title value {preview!r} looks like a misplaced row "
+            f"update (starts with `CapitalizedKey=…`). Refusing to "
+            f"set as title. To update the `{value.split('=', 1)[0]}` "
+            f"field, use `urow <ID>\\n  "
+            f"{value.split('=', 1)[0]}=<value>`. If this really is "
+            f"the title you want, rephrase without the leading "
+            f"`Key=` shape."
+        )
+    return None
+
+
 def _build_property_value(
     prop_type: str,
     value: str,
@@ -5576,6 +5637,11 @@ def _build_property_value(
         Notion API property value dict, or None if conversion fails
     """
     if prop_type == "title":
+        if _validate_title_value(value) is not None:
+            # Refuse suspicious titles — returning None lets the
+            # caller (_build_row_properties) surface the specific
+            # reason in its unresolved list.
+            return None
         return {"title": _text_to_rich_text(value, registry)}
     elif prop_type == "rich_text":
         return {"rich_text": _text_to_rich_text(value, registry)}
@@ -5681,6 +5747,18 @@ def _build_row_properties(
             continue
 
         prop_type = prop_def.get("type")
+
+        # Title columns get the suspicious-title check so the
+        # error explains exactly why it was refused, rather than
+        # the generic "couldn't be converted".
+        if prop_type == "title":
+            title_err = _validate_title_value(value)
+            if title_err is not None:
+                unresolved.append(
+                    f"column {col_name!r} (title): {title_err}"
+                )
+                continue
+
         prop_value = _build_property_value(prop_type, value, registry)
         if prop_value is None:
             unresolved.append(
@@ -5957,6 +6035,12 @@ async def execute_apply_op(
                         "id", target_uuid
                     )
                     title = op.new_text or ""
+                    title_err = _validate_title_value(title)
+                    if title_err is not None:
+                        return {}, _error(
+                            "SUSPICIOUS_TITLE",
+                            f"u on database {op.target}: {title_err}",
+                        )
                     try:
                         await _notion_request_async(
                             "PATCH", f"/databases/{db_id}",
@@ -5974,6 +6058,12 @@ async def execute_apply_op(
                 # Real page — rename its title via the Pages API.
                 page_id = block.get(block_type, {}).get("id", target_uuid)
                 title = op.new_text or ""
+                title_err = _validate_title_value(title)
+                if title_err is not None:
+                    return {}, _error(
+                        "SUSPICIOUS_TITLE",
+                        f"u on page {op.target}: {title_err}",
+                    )
                 try:
                     await _notion_request_async(
                         "PATCH", f"/pages/{page_id}",
@@ -6251,6 +6341,12 @@ async def execute_apply_op(
             # Build page properties (title)
             page_props: dict = {}
             if op.title:
+                title_err = _validate_title_value(op.title)
+                if title_err is not None:
+                    return {}, _error(
+                        "SUSPICIOUS_TITLE",
+                        f"+page parent={op.parent}: {title_err}",
+                    )
                 page_props["title"] = {"title": _text_to_rich_text(op.title, registry)}
 
             # Build page body
@@ -6327,6 +6423,12 @@ async def execute_apply_op(
 
             # Update title if provided
             if op.title is not None:
+                title_err = _validate_title_value(op.title)
+                if title_err is not None:
+                    return {}, _error(
+                        "SUSPICIOUS_TITLE",
+                        f"upage {op.target}: {title_err}",
+                    )
                 if is_database:
                     # Databases: top-level `title` rich_text array
                     update_body["title"] = _text_to_rich_text(
@@ -6459,6 +6561,17 @@ async def execute_apply_op(
                 title_arr = title_prop.get("title", [])
                 new_title = "".join(t.get("plain_text", "") for t in title_arr) if title_arr else "Copy"
 
+            # Validate the chosen title. The source-page title
+            # path is theoretically safe (Notion stored it cleanly),
+            # but a user-supplied op.title can carry a misplaced
+            # row-update payload — same defense as +page / upage.
+            title_err = _validate_title_value(new_title)
+            if title_err is not None:
+                return {}, _error(
+                    "SUSPICIOUS_TITLE",
+                    f"cpage {op.source}: {title_err}",
+                )
+
             # Build new page
             page_body: dict = {
                 "parent": {"page_id": dest_uuid},
@@ -6527,6 +6640,15 @@ async def execute_apply_op(
 
             if not op.property_defs:
                 return {}, "+db: no property definitions provided"
+
+            # Validate title — same defense as +page/upage/etc.
+            if op.title:
+                title_err = _validate_title_value(op.title)
+                if title_err is not None:
+                    return {}, _error(
+                        "SUSPICIOUS_TITLE",
+                        f"+db parent={op.parent}: {title_err}",
+                    )
 
             # Build properties schema
             properties: dict = {}

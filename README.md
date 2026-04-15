@@ -111,6 +111,10 @@ codex mcp add nbjm-mcp -- uvx --refresh --from git+https://github.com/newknew/nb
 
 ## Changelog
 
+### v0.5.0 — 2026-04-15
+
+- **Refuse misplaced row-update payloads as titles** — every path that sets a page, row, or database title (`+page`, `+db`, `+row` Name column, `upage`, `cpage`, `u` on page/database, `urow`, `u <rowID>` Name column) now refuses values that look like a row-update payload landing in the wrong place. Two bright-line checks: the value contains a literal tab character (tabs are the DSL's column separator for row updates — a title with a tab is almost certainly a misplaced update), or the value starts with a `CapitalizedKey=Value` pattern (e.g. `Last contact=2026-04-10`). Rejections come back as `SUSPICIOUS_TITLE` with a specific reason and a suggested `urow` rewrite. Regression for the contact-db corruption that produced dozens of rows with titles like `Last contact=2026-04-10\tLast platform=WhatsApp` across prior sessions — the earlier u-on-row fix closed one path, this closes the perimeter.
+
 ### v0.4.0 — 2026-04-14
 
 - **Relation property writes** — `+row`, `urow`, and `u <rowID>` now write to `relation` columns. Values are comma-separated page references (short ID, dashed UUID, or dashless UUID); a single relation is `Who=N2jf`, multi-target is `Tags=N2jf, R4kQ`. Previously `_build_property_value` had no case for `"relation"` and returned `None`, so the row builder silently skipped relation columns — `+row ... Who=N2jf` reported `ok` but the relation was empty, and `urow` / `u` returned `No valid properties to update` even when a valid relation was in the payload.

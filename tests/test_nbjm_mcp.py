@@ -39,6 +39,7 @@ from nbjm_mcp import (
     _parse_content_blocks,
     _parse_row_values,
     _read_impl,
+    _validate_title_value,
     _reupload_notion_file,
     _text_to_rich_text,
     _tokenize_filter,
@@ -2094,6 +2095,75 @@ class TestBuildRowProperties:
 # =============================================================================
 # @mentions in Titles Tests
 # =============================================================================
+
+
+class TestValidateTitleValue:
+    """Tests for _validate_title_value — the defense against
+    misplaced multi-field updates landing in page/row titles.
+
+    Rule: a title value must not (a) contain a literal tab, nor
+    (b) start with a capitalized Key=Value pattern. Both are
+    telltales of a row-update payload in the wrong place.
+    Catches the bug class that produced 23+ corrupted contacts.
+    """
+
+    def test_accepts_plain_title(self):
+        assert _validate_title_value("Amanda Kelly") is None
+
+    def test_accepts_title_with_punctuation(self):
+        assert _validate_title_value("Q1 Planning 2026") is None
+        assert _validate_title_value("meeting: notes") is None
+        assert _validate_title_value("2+2=4 (a proof)") is None
+        assert _validate_title_value("Budget = $50") is None
+
+    def test_accepts_empty_title(self):
+        # Empty is legal (e.g., clearing a title). Not our job.
+        assert _validate_title_value("") is None
+
+    def test_accepts_single_trailing_equals(self):
+        # "Foo=" with no value after — common trailing noise,
+        # not a multi-field update. Don't reject.
+        assert _validate_title_value("Foo=") is None
+
+    def test_rejects_tab_character(self):
+        """Any tab character in a title is rejected — tabs are
+        the DSL's column separator for row updates."""
+        err = _validate_title_value(
+            "Last contact=2026-04-10\tLast platform=WhatsApp"
+        )
+        assert err is not None
+        assert "tab" in err.lower()
+
+    def test_rejects_tab_even_without_equals(self):
+        """A plain tab-separated string is still clearly not a
+        title. Reject."""
+        err = _validate_title_value("foo\tbar")
+        assert err is not None
+        assert "tab" in err.lower()
+
+    def test_rejects_key_equals_pattern(self):
+        """Title starting with `CapitalizedKey=...` looks like a
+        misplaced row update. Reject."""
+        err = _validate_title_value("Last contact=2026-04-10")
+        assert err is not None
+        assert "update" in err.lower() or "key=" in err.lower()
+
+    def test_rejects_single_word_key_equals(self):
+        err = _validate_title_value("Name=Alex")
+        assert err is not None
+
+    def test_rejects_status_equals(self):
+        err = _validate_title_value("Status=Done")
+        assert err is not None
+
+    def test_accepts_lowercase_key_equals(self):
+        """Only capitalized keys are flagged — lowercase prefixes
+        are too common in legit titles to reject."""
+        assert _validate_title_value("foo=bar") is None
+
+    def test_accepts_numeric_leading(self):
+        """Titles starting with non-letters aren't flagged."""
+        assert _validate_title_value("2026=year of the dragon") is None
 
 
 class TestTextToRichText:
@@ -4783,6 +4853,287 @@ class TestCopyPageReturnShape:
         new_short_id = created[0]
         assert new_short_id
         assert registry.resolve(new_short_id) == copy_uuid
+
+
+class TestSuspiciousTitleDefense:
+    """Defense-in-depth against misplaced row updates landing as
+    page/row titles. Every code path that sets a title — `+row`
+    Name column, `urow`/`u <rowID>` Name column, `upage` on page
+    or row or database, `u` on page or database, `+page`, `+db`,
+    `cpage` — refuses values that look like a misplaced
+    multi-field update.
+
+    Regression for contact-db corruption pattern: rows with
+    Name=`Last contact=2026-04-10\tLast platform=WhatsApp`. The
+    underlying parser paths that produced those were fixed, but
+    this tightens the perimeter so a new path can't reintroduce
+    the same corruption class.
+    """
+
+    def test_build_property_value_title_with_tab_returns_none(self):
+        """_build_property_value on a title column rejects tabs,
+        returning None so _build_row_properties reports it as
+        unresolved instead of silently corrupting the title."""
+        result = _build_property_value(
+            "title",
+            "Last contact=2026-04-10\tLast platform=WhatsApp",
+        )
+        assert result is None
+
+    def test_build_property_value_title_with_key_equals_returns_none(self):
+        """Same for `Key=Value` leading pattern — refuses."""
+        result = _build_property_value("title", "Last contact=2026-04-10")
+        assert result is None
+
+    def test_build_property_value_normal_title_still_works(self):
+        """Regression: boring titles still pass through."""
+        result = _build_property_value("title", "Amanda Kelly")
+        assert result is not None
+        assert result["title"][0]["text"]["content"] == "Amanda Kelly"
+
+    def test_build_row_properties_surfaces_suspicious_title(self):
+        """+row / urow with a Name value that looks like a row
+        update payload must surface the specific reason via the
+        unresolved list — not a generic 'couldn't be converted'."""
+        row_values = {"Name": "Last contact=2026-04-10\tLast platform=WhatsApp"}
+        db_props = {"Name": {"type": "title"}}
+        props, unresolved = _build_row_properties(row_values, db_props)
+        # Name was refused.
+        assert "Name" not in props
+        assert len(unresolved) == 1
+        # The error must reference the suspicious-title reason.
+        msg = unresolved[0].lower()
+        assert "tab" in msg or "title" in msg
+
+    def test_upage_on_row_with_tab_title_errors(self, monkeypatch):
+        """upage <rowID> = "payload with tab" refuses to PATCH.
+        Previously stuffed the whole quoted string into the Name
+        property, corrupting the row."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                # Not a database — just a regular child_page (which
+                # a db row also is, structurally).
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Joss Pecout"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["R0W1"] = "row-uuid-1"
+        registry._uuid_to_short["row-uuid-1"] = "R0W1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE_PAGE,
+            target="R0W1",
+            title="Last contact=2026-04-10\tLast platform=WhatsApp",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert "title" in err.lower()
+        assert "tab" in err.lower() or "update" in err.lower()
+        # Critical: no PATCH was issued. The title was not corrupted.
+        assert not any(c[0] == "PATCH" for c in patched_calls)
+
+    def test_u_on_page_with_tab_title_errors(self, monkeypatch):
+        """u <pageID> = "tab payload" on a real child_page refuses
+        the title rename."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Old title"},
+                    "parent": {"type": "page_id", "page_id": "parent-uuid"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Pg9X"] = "page-uuid-9"
+        registry._uuid_to_short["page-uuid-9"] = "Pg9X"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Pg9X",
+            new_text="Last contact=2026-04-10\tLast platform=WhatsApp",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert "title" in err.lower()
+        assert not any(c[0] == "PATCH" for c in patched_calls)
+
+    def test_u_on_database_with_key_equals_title_errors(
+        self, monkeypatch
+    ):
+        """u <dbID> = "Key=Value" refuses to rename the database
+        to a value that looks like a field update."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Old DB"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Db3x"] = "db-uuid-3"
+        registry._uuid_to_short["db-uuid-3"] = "Db3x"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE,
+            target="Db3x",
+            new_text="Status=Active",  # capitalized Key=Value
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert not any(c[0] == "PATCH" for c in patched_calls)
+
+    def test_upage_on_database_with_tab_title_errors(
+        self, monkeypatch
+    ):
+        """upage on a child_database must also refuse tab-bearing
+        titles (separate code path from `u`)."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_database",
+                    "child_database": {"title": "Old DB"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Db2"] = "db-uuid-2"
+        registry._uuid_to_short["db-uuid-2"] = "Db2"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.UPDATE_PAGE,
+            target="Db2",
+            title="Col1=val1\tCol2=val2",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert not any(c[0] == "PATCH" for c in patched_calls)
+
+    def test_add_page_with_tab_title_errors(self, monkeypatch):
+        """+page title='...' refuses tab-bearing titles."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and "/blocks/" in endpoint:
+                return {
+                    "type": "child_page",
+                    "child_page": {"title": "Parent"},
+                }
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Par1"] = "parent-uuid"
+        registry._uuid_to_short["parent-uuid"] = "Par1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.ADD_PAGE,
+            parent="Par1",
+            title="Last contact=2026-04-10\tLast platform=WhatsApp",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        # No POST to /pages was issued.
+        assert not any(
+            c[0] == "POST" and c[1] == "/pages" for c in patched_calls
+        )
+
+    def test_copy_page_with_tab_title_errors(self, monkeypatch):
+        """cpage ... title='...' refuses tab-bearing titles."""
+        import nbjm_mcp
+
+        patched_calls = []
+
+        async def mock_request(method, endpoint, json_body=None, params=None):
+            patched_calls.append((method, endpoint, json_body))
+            if method == "GET" and endpoint.startswith("/pages/"):
+                return {"id": "src-uuid", "properties": {"title": {
+                    "type": "title",
+                    "title": [{"type": "text", "text": {"content": "Src"},
+                               "plain_text": "Src"}]}}}
+            return {}
+
+        monkeypatch.setattr(nbjm_mcp,
+                            "_notion_request_async", mock_request)
+
+        registry = IdRegistry()
+        registry._short_to_uuid["Src1"] = (
+            "11111111-1111-1111-1111-111111111111"
+        )
+        registry._uuid_to_short[
+            "11111111-1111-1111-1111-111111111111"
+        ] = "Src1"
+        registry._short_to_uuid["Dst1"] = (
+            "22222222-2222-2222-2222-222222222222"
+        )
+        registry._uuid_to_short[
+            "22222222-2222-2222-2222-222222222222"
+        ] = "Dst1"
+
+        op = ApplyOp(
+            line_num=0,
+            command=ApplyCommand.COPY_PAGE,
+            source="Src1",
+            dest_parent="Dst1",
+            title="Col=val\tOther=stuff",
+        )
+        result, err = asyncio.run(execute_apply_op(op, registry))
+
+        assert err is not None
+        assert not any(
+            c[0] == "POST" and c[1] == "/pages" for c in patched_calls
+        )
 
 
 # =============================================================================
