@@ -141,6 +141,8 @@ To use marker chars as literal text, escape with backslash.
 | `!col N` | column | Structural (N = position, 1-indexed) |
 | `!table N` | table | Structural (N = column count) |
 | `\| c1 \| c2 \|` | table_row | Pipe-delimited cells |
+| `!img url=…` | image | External URL |
+| `!img path=…` | image | Local upload, ≤20 MB |
 
 ---
 
@@ -158,9 +160,10 @@ structural blocks are fully read/write.
 
 **Bang (`!`) prefix disambiguation order** (first match wins):
 1. Colored callout: `!color text` (gray, blue, red, etc.)
-2. Opaque block: `!type~` or `!type~ (caption)`
-3. Structural block: `!type N` (where type is `cols`, `col`, or `table`)
-4. Default callout: `! text`
+2. Image upload: `!img url=…` or `!img path=… [caption="…"]`
+3. Opaque block: `!type~` or `!type~ (caption)`
+4. Structural block: `!type N` (where type is `cols`, `col`, or `table`)
+5. Default callout: `! text`
 
 ### Tables
 
@@ -200,6 +203,20 @@ C3d4   !col 1
 E5f6     First column content
 G7h8   !col 2
 I9j0     Second column content
+```
+
+### Images (write-side `!img`)
+
+- `!img url=https://e.com/x.png` — external URL, externally hosted
+- `!img path=/abs/local/file.png` — local file, uploaded to Notion
+- Append `caption="…"` for an inline caption (rich-text supported)
+- Local uploads use Notion's `/file_uploads` API; ≤20 MB single-part
+- Existing image blocks still render `!image~` on read (back-compat)
+
+```
++ parent=A1b2
+  !img path=/tmp/chart.png caption="Monthly spend"
+  !img url=https://example.com/header.jpg
 ```
 
 ---
@@ -1023,14 +1040,15 @@ Check in order (first match wins):
 12. `| ... |` → table_row (pipe-delimited with trailing `|`)
 13. `| ` → quote (pipe, no trailing `|`)
 14. `!color ` → colored callout
-15. `!type~` → opaque block
-16. `!type N` → structural block (cols, col, table)
-17. `! ` → default callout
-18. `§ ` → child_page
-19. `⊞ ` → child_database
-20. `→ ` → link_to_page
-21. ` ``` ` → code block
-22. (else) → paragraph
+15. `!img …` → writable image
+16. `!type~` → opaque block
+17. `!type N` → structural block (cols, col, table)
+18. `! ` → default callout
+19. `§ ` → child_page
+20. `⊞ ` → child_database
+21. `→ ` → link_to_page
+22. ` ``` ` → code block
+23. (else) → paragraph
 
 ---
 

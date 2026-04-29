@@ -444,6 +444,11 @@ class NbjmBlock:
     color: Optional[str] = None  # For callout blocks (e.g., "gray_background")
     opaque: bool = False  # For opaque blocks (!type~)
     structural: bool = False  # For structural blocks (!type N)
+    # For writable image blocks (!img url=... | path=... [caption="..."])
+    image_url: Optional[str] = None
+    image_path: Optional[str] = None
+    image_caption: Optional[str] = None
+    image_file_upload_id: Optional[str] = None  # Stamped by upload pre-pass
     warnings: list[str] = field(default_factory=list)  # Parser warnings
 
 
@@ -485,6 +490,57 @@ BLOCK_MARKERS = [
     # Code block start (3+ backticks, optional language — may contain spaces e.g. "plain text")
     (re.compile(r'^`{3,}(.*)$'), 'code', {}),
 ]
+
+
+def _parse_img_marker(content: str) -> tuple[dict[str, Any], list[str]]:
+    """Parse the body of an !img line into image_url/image_path/image_caption.
+
+    Accepts shlex-style key=value tokens after the leading "!img":
+        !img url=https://e.com/x.png
+        !img path=/tmp/chart.png caption="Monthly spend"
+    """
+    import shlex
+
+    body = content[len('!img'):].lstrip()
+    attrs: dict[str, Any] = {
+        'image_url': None,
+        'image_path': None,
+        'image_caption': None,
+    }
+    warnings: list[str] = []
+
+    if not body:
+        warnings.append("!img requires url=... or path=...")
+        return attrs, warnings
+
+    try:
+        tokens = shlex.split(body, posix=True)
+    except ValueError as e:
+        warnings.append(f"!img parse error: {e}")
+        return attrs, warnings
+
+    for tok in tokens:
+        if '=' not in tok:
+            warnings.append(f"!img: ignoring token without '=' ({tok!r})")
+            continue
+        key, _, value = tok.partition('=')
+        key = key.strip().lower()
+        if key == 'url':
+            attrs['image_url'] = value
+        elif key == 'path':
+            attrs['image_path'] = value
+        elif key == 'caption':
+            attrs['image_caption'] = value
+        else:
+            warnings.append(f"!img: unknown key {key!r} (expected url/path/caption)")
+
+    if not attrs['image_url'] and not attrs['image_path']:
+        warnings.append("!img requires url=... or path=...")
+    if attrs['image_url'] and attrs['image_path']:
+        warnings.append("!img: url= and path= are mutually exclusive; using path=")
+        attrs['image_url'] = None
+
+    return attrs, warnings
 
 
 def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]:
@@ -532,7 +588,14 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
                     )
             return 'callout', matched_text, {'color': callout_match.group(1) + '_background'}, warnings
 
-        # 2. Opaque block: !type~ or !type~ (caption)
+        # 2. Image upload marker: !img url=... | path=... [caption="..."]
+        # Recognized before opaque so a future !img~ render and !img write
+        # don't collide. Caption is shlex-parsed so spaces inside quotes work.
+        if content.startswith('!img ') or content == '!img':
+            img_attrs, img_warnings = _parse_img_marker(content)
+            return 'image', '', img_attrs, img_warnings
+
+        # 3. Opaque block: !type~ or !type~ (caption)
         opaque_match = re.match(r'^!(\w+)~(.*)$', content)
         if opaque_match and opaque_match.group(1) in OPAQUE_BLOCK_TYPES:
             opaque_type = opaque_match.group(1)
@@ -541,13 +604,13 @@ def parse_block_type(content: str) -> tuple[str, str, dict[str, Any], list[str]]
                 caption = caption[1:-1]
             return opaque_type, caption, {'opaque': True}, warnings
 
-        # 3. Structural block: !type N
+        # 4. Structural block: !type N
         struct_match = re.match(r'^!(\w+) (\d+)$', content)
         if struct_match and struct_match.group(1) in STRUCTURAL_BLOCK_TYPES:
             real_type = STRUCTURAL_BLOCK_TYPES[struct_match.group(1)]
             return real_type, struct_match.group(2), {'structural': True}, warnings
 
-        # 4. Default callout: ! text (fallback)
+        # 5. Default callout: ! text (fallback)
         default_match = re.match(r'^! (.*)$', content)
         if default_match:
             matched_text = default_match.group(1)
@@ -4673,12 +4736,34 @@ def nbjm_block_to_notion(block: NbjmBlock, registry: IdRegistry) -> dict:
             "child_database": {"title": block.content}
         }
 
+    elif block_type == "image" and not block.opaque:
+        # Writable image block from !img marker. The upload pre-pass
+        # stamps image_file_upload_id when image_path was provided; if
+        # neither url nor upload_id is present we fall through to a
+        # paragraph so the user sees a clear error rather than a 400.
+        image_data: dict = {}
+        if block.image_caption:
+            image_data["caption"] = rich_text_spans_to_notion(
+                parse_inline_formatting(block.image_caption), registry
+            )
+        if block.image_file_upload_id:
+            image_data["type"] = "file_upload"
+            image_data["file_upload"] = {"id": block.image_file_upload_id}
+            return {"type": "image", "image": image_data}
+        if block.image_url:
+            image_data["type"] = "external"
+            image_data["external"] = {"url": block.image_url}
+            return {"type": "image", "image": image_data}
+        # Missing source — fall through to paragraph fallback below.
+
     else:
-        # Fallback: treat as paragraph
-        return {
-            "type": "paragraph",
-            "paragraph": {"rich_text": rich_text}
-        }
+        pass
+
+    # Fallback: treat as paragraph
+    return {
+        "type": "paragraph",
+        "paragraph": {"rich_text": rich_text}
+    }
 
 
 def build_block_tree(blocks: list[NbjmBlock], registry: IdRegistry) -> list[dict]:
@@ -5410,6 +5495,152 @@ async def _reupload_notion_file(file_obj: dict) -> tuple[dict, Optional[str]]:
         return file_obj, f"file re-upload failed ({e}), using expiring URL"
 
 
+# Single-part upload limit per Notion's file_uploads API.
+NOTION_UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+NOTION_UPLOAD_MAX_FILENAME_BYTES = 900
+
+# Image extensions Notion accepts for image blocks.
+IMAGE_CONTENT_TYPE_MAP = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "svg": "image/svg+xml",
+    "heic": "image/heic", "tif": "image/tiff", "tiff": "image/tiff",
+    "bmp": "image/bmp", "ico": "image/x-icon", "avif": "image/avif",
+    "apng": "image/apng",
+}
+
+
+async def _upload_local_file_to_notion(
+    file_path: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Upload a local file to Notion via the file_uploads API.
+
+    Mirrors steps 2-4 of _reupload_notion_file but reads bytes from disk
+    instead of downloading a presigned URL. Returns (upload_id, warning).
+    On failure upload_id is None and warning describes the cause.
+    """
+    p = Path(file_path)
+    if not p.is_file():
+        return None, f"file not found: {file_path}"
+    try:
+        size = p.stat().st_size
+    except OSError as e:
+        return None, f"could not stat {file_path}: {e}"
+    if size == 0:
+        return None, f"file is empty: {file_path}"
+    if size > NOTION_UPLOAD_MAX_BYTES:
+        return None, (
+            f"file {file_path} is {size} bytes, "
+            f"exceeds Notion single-part upload limit "
+            f"({NOTION_UPLOAD_MAX_BYTES} bytes)"
+        )
+
+    filename = p.name
+    if len(filename.encode("utf-8")) > NOTION_UPLOAD_MAX_FILENAME_BYTES:
+        return None, f"filename too long (>900 bytes): {filename}"
+
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    content_type = IMAGE_CONTENT_TYPE_MAP.get(ext, "application/octet-stream")
+
+    try:
+        file_bytes = p.read_bytes()
+    except OSError as e:
+        return None, f"could not read {file_path}: {e}"
+
+    try:
+        upload_response = await _notion_request_async(
+            "POST",
+            "/file_uploads",
+            json_body={
+                "mode": "single_part",
+                "filename": filename,
+                "content_type": content_type,
+            },
+        )
+        upload_id = upload_response.get("id")
+        upload_url = upload_response.get("upload_url")
+        if not upload_id or not upload_url:
+            return None, "file upload API returned no ID/URL"
+
+        client = await _get_async_client()
+        token = _get_token()
+        upload_resp = await client.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Notion-Version": NOTION_VERSION,
+            },
+            files={"file": (filename, file_bytes, content_type)},
+        )
+        upload_resp.raise_for_status()
+
+        max_polls = 10
+        for poll_attempt in range(max_polls):
+            await asyncio.sleep(min(1.0 * (1.5 ** poll_attempt), 5.0))
+            status_response = await _notion_request_async(
+                "GET", f"/file_uploads/{upload_id}"
+            )
+            status = status_response.get("status")
+            if status == "uploaded":
+                return upload_id, None
+            if status in ("failed", "expired"):
+                return None, f"file upload {status}"
+
+        return None, "file upload timed out"
+
+    except httpx.HTTPStatusError as e:
+        body = ""
+        if e.response is not None:
+            try:
+                body = e.response.text
+            except Exception:
+                pass
+        logger.warning(f"Local file upload failed: {e} body={body}")
+        return None, (
+            f"upload failed ({e.response.status_code if e.response else '?'}: "
+            f"{body or e})"
+        )
+    except Exception as e:
+        logger.warning(f"Local file upload failed: {e}")
+        return None, f"upload failed ({e})"
+
+
+async def _resolve_image_uploads(blocks: list["NbjmBlock"]) -> list[str]:
+    """Walk parsed blocks; upload any image_path images and stamp upload IDs.
+
+    Mutates each NbjmBlock in place by setting image_file_upload_id on
+    blocks with image_path. Returns a list of warnings (one per failure)
+    so the caller can surface them on the apply result.
+    """
+    warnings: list[str] = []
+
+    def _collect(bs: list["NbjmBlock"]) -> list["NbjmBlock"]:
+        out: list["NbjmBlock"] = []
+        for b in bs:
+            out.append(b)
+            if b.children:
+                out.extend(_collect(b.children))
+        return out
+
+    targets = [
+        b for b in _collect(blocks)
+        if b.block_type == "image" and not b.opaque
+        and b.image_path and not b.image_file_upload_id
+    ]
+    if not targets:
+        return warnings
+
+    results = await asyncio.gather(
+        *(_upload_local_file_to_notion(b.image_path) for b in targets)
+    )
+    for b, (upload_id, warning) in zip(targets, results):
+        if upload_id:
+            b.image_file_upload_id = upload_id
+        if warning:
+            warnings.append(f"!img path={b.image_path}: {warning}")
+            b.warnings.append(f"image upload failed: {warning}")
+    return warnings
+
+
 # Block types that contain Notion-hosted file references
 FILE_BEARING_BLOCK_TYPES = {"image", "file", "video", "pdf"}
 
@@ -6024,6 +6255,9 @@ async def execute_apply_op(
                 except Exception:
                     pass  # If fetch fails, proceed with original blocks
 
+                # Upload any local-path images so build_block_tree
+                # can render them as file_upload references.
+                await _resolve_image_uploads(regular_blocks)
                 notion_blocks = build_block_tree(regular_blocks, registry)
                 num_created = len(notion_blocks)
 
@@ -6515,6 +6749,7 @@ async def execute_apply_op(
             # Add content blocks if provided
             created_ids = [short_id]
             if op.content_blocks and page_id:
+                await _resolve_image_uploads(op.content_blocks)
                 notion_blocks = build_block_tree(op.content_blocks, registry)
                 created = await append_blocks_async(page_id, notion_blocks)
                 for block in created:

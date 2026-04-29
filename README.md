@@ -105,11 +105,23 @@ codex mcp add nbjm-mcp -- uvx --refresh --from git+https://github.com/newknew/nb
 ## Not yet supported
 
 - **Synced blocks** — displayed as placeholder, can't create
-- **Images/video/files** — displayed as `!image` etc.; can't
-  be created via the API
+- **Video/file blocks** — displayed as `!file~` etc.; can't
+  be created via the API (use `!img` for images)
 - **Block equations** — read-only (inline `:eq[expr]` works)
 
 ## Changelog
+
+### v0.7.0 — 2026-04-29
+
+- **Image block creation via `!img`** — `notion_apply` scripts can
+  now create image blocks inline. Two forms:
+  `!img url=https://example.com/x.png` (external URL, externally
+  hosted) and `!img path=/abs/local/file.png` (local file uploaded
+  via Notion's `/file_uploads` API, ≤20 MB single-part). Add
+  `caption="…"` for inline captions with full rich-text support.
+  Previously agents had to upload PNGs to Drive and link to them,
+  which broke inline rendering. Existing image blocks still render
+  as `!image~` on read for backwards compatibility.
 
 ### v0.5.0 — 2026-04-15
 

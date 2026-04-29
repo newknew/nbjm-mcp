@@ -3633,6 +3633,158 @@ class TestReuploadNotionFile:
         assert "failed" in warning
 
 
+class TestUploadLocalFileToNotion:
+    """Tests for _upload_local_file_to_notion (local-path upload)."""
+
+    def test_missing_file_returns_warning(self, tmp_path):
+        import nbjm_mcp
+        upload_id, warning = asyncio.run(
+            nbjm_mcp._upload_local_file_to_notion(str(tmp_path / "nope.png"))
+        )
+        assert upload_id is None
+        assert "not found" in warning
+
+    def test_empty_file_returns_warning(self, tmp_path):
+        import nbjm_mcp
+        f = tmp_path / "empty.png"
+        f.write_bytes(b"")
+        upload_id, warning = asyncio.run(
+            nbjm_mcp._upload_local_file_to_notion(str(f))
+        )
+        assert upload_id is None
+        assert "empty" in warning
+
+    def test_oversized_file_returns_warning(self, tmp_path, monkeypatch):
+        import nbjm_mcp
+        monkeypatch.setattr(nbjm_mcp, "NOTION_UPLOAD_MAX_BYTES", 4)
+        f = tmp_path / "big.png"
+        f.write_bytes(b"abcdefgh")
+        upload_id, warning = asyncio.run(
+            nbjm_mcp._upload_local_file_to_notion(str(f))
+        )
+        assert upload_id is None
+        assert "exceeds" in warning
+
+    def test_successful_upload(self, tmp_path, monkeypatch):
+        import nbjm_mcp
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\nfake-image-bytes")
+
+        poll_count = 0
+
+        async def mock_request(method, endpoint, json_body=None):
+            nonlocal poll_count
+            if method == "POST" and endpoint == "/file_uploads":
+                assert json_body["filename"] == "chart.png"
+                assert json_body["content_type"] == "image/png"
+                return {
+                    "id": "abc-id",
+                    "upload_url": "https://api.notion.com/v1/file_uploads/abc-id/send",
+                    "status": "pending",
+                }
+            if method == "GET" and "/file_uploads/" in endpoint:
+                poll_count += 1
+                if poll_count >= 1:
+                    return {"id": "abc-id", "status": "uploaded"}
+                return {"id": "abc-id", "status": "pending"}
+            return {}
+
+        class MockResponse:
+            status_code = 200
+            def raise_for_status(self):
+                pass
+
+        class MockClient:
+            async def post(self, url, **kwargs):
+                return MockResponse()
+
+        async def mock_get_client():
+            return MockClient()
+
+        monkeypatch.setattr(nbjm_mcp, "_notion_request_async", mock_request)
+        monkeypatch.setattr(nbjm_mcp, "_get_async_client", mock_get_client)
+        monkeypatch.setattr(nbjm_mcp, "_get_token", lambda: "fake-token")
+
+        upload_id, warning = asyncio.run(
+            nbjm_mcp._upload_local_file_to_notion(str(f))
+        )
+        assert upload_id == "abc-id"
+        assert warning is None
+
+
+class TestResolveImageUploads:
+    """Tests for _resolve_image_uploads pre-pass."""
+
+    def test_stamps_upload_id_on_blocks(self, tmp_path, monkeypatch):
+        import nbjm_mcp
+        from nbjm_mcp import NbjmBlock
+
+        f = tmp_path / "chart.png"
+        f.write_bytes(b"png-bytes")
+
+        async def fake_upload(path):
+            assert path == str(f)
+            return "stamped-id", None
+
+        monkeypatch.setattr(
+            nbjm_mcp, "_upload_local_file_to_notion", fake_upload
+        )
+
+        block = NbjmBlock(
+            short_id="",
+            level=0,
+            block_type="image",
+            content="",
+            image_path=str(f),
+        )
+        warnings = asyncio.run(nbjm_mcp._resolve_image_uploads([block]))
+        assert warnings == []
+        assert block.image_file_upload_id == "stamped-id"
+
+    def test_skips_url_only_and_already_stamped(self, monkeypatch):
+        import nbjm_mcp
+        from nbjm_mcp import NbjmBlock
+
+        async def fake_upload(path):
+            raise AssertionError("should not be called")
+
+        monkeypatch.setattr(
+            nbjm_mcp, "_upload_local_file_to_notion", fake_upload
+        )
+
+        url_block = NbjmBlock(
+            short_id="", level=0, block_type="image", content="",
+            image_url="https://e.com/x.png",
+        )
+        stamped_block = NbjmBlock(
+            short_id="", level=0, block_type="image", content="",
+            image_path="/tmp/x.png", image_file_upload_id="already",
+        )
+        warnings = asyncio.run(
+            nbjm_mcp._resolve_image_uploads([url_block, stamped_block])
+        )
+        assert warnings == []
+
+    def test_failure_recorded_as_warning(self, monkeypatch):
+        import nbjm_mcp
+        from nbjm_mcp import NbjmBlock
+
+        async def fake_upload(path):
+            return None, "boom"
+
+        monkeypatch.setattr(
+            nbjm_mcp, "_upload_local_file_to_notion", fake_upload
+        )
+        block = NbjmBlock(
+            short_id="", level=0, block_type="image", content="",
+            image_path="/tmp/x.png",
+        )
+        warnings = asyncio.run(nbjm_mcp._resolve_image_uploads([block]))
+        assert any("boom" in w for w in warnings)
+        assert any("upload failed" in w for w in block.warnings)
+        assert block.image_file_upload_id is None
+
+
 # =============================================================================
 # NBJM Round-Trip Tests (Mention Types)
 # =============================================================================
@@ -5399,6 +5551,98 @@ class TestBangDisambiguation:
         btype, _, attrs, _ = parse_block_type("!image~")
         assert btype == "image"
         assert attrs.get("opaque") is True
+
+
+class TestImgMarkerParse:
+    """!img marker creates writable image blocks."""
+
+    def test_img_external_url(self):
+        """!img url=... → image block with external URL."""
+        btype, content, attrs, warnings = parse_block_type(
+            "!img url=https://example.com/chart.png"
+        )
+        assert btype == "image"
+        assert attrs.get("opaque") is None or attrs.get("opaque") is False
+        assert attrs.get("image_url") == "https://example.com/chart.png"
+        assert attrs.get("image_path") is None
+        assert attrs.get("image_caption") in (None, "")
+        assert warnings == []
+
+    def test_img_local_path(self):
+        """!img path=... → image block with local upload path."""
+        btype, content, attrs, _ = parse_block_type("!img path=/tmp/chart.png")
+        assert btype == "image"
+        assert attrs.get("image_path") == "/tmp/chart.png"
+        assert attrs.get("image_url") is None
+
+    def test_img_with_caption(self):
+        """!img with caption= captures quoted caption text."""
+        btype, content, attrs, _ = parse_block_type(
+            '!img path=/tmp/chart.png caption="Monthly spend"'
+        )
+        assert btype == "image"
+        assert attrs.get("image_path") == "/tmp/chart.png"
+        assert attrs.get("image_caption") == "Monthly spend"
+
+    def test_img_url_with_caption(self):
+        """!img url=... caption=... combination."""
+        btype, content, attrs, _ = parse_block_type(
+            '!img url=https://e.com/x.png caption="External chart"'
+        )
+        assert btype == "image"
+        assert attrs.get("image_url") == "https://e.com/x.png"
+        assert attrs.get("image_caption") == "External chart"
+
+
+class TestImgBlockBuilder:
+    """nbjm_block_to_notion produces correct image block JSON."""
+
+    def test_external_url_block(self):
+        """!img url=... builds {type:image, image:{type:external, ...}}."""
+        block = NbjmBlock(
+            short_id="",
+            level=0,
+            block_type="image",
+            content="",
+            image_url="https://example.com/chart.png",
+        )
+        result = nbjm_block_to_notion(block, IdRegistry())
+        assert result["type"] == "image"
+        assert result["image"]["type"] == "external"
+        assert result["image"]["external"]["url"] == "https://example.com/chart.png"
+
+    def test_external_url_with_caption(self):
+        """Caption rendered as rich_text on the image block."""
+        block = NbjmBlock(
+            short_id="",
+            level=0,
+            block_type="image",
+            content="",
+            image_url="https://example.com/chart.png",
+            image_caption="Monthly spend",
+        )
+        result = nbjm_block_to_notion(block, IdRegistry())
+        caption = result["image"].get("caption", [])
+        assert any(
+            span.get("plain_text") == "Monthly spend"
+            or span.get("text", {}).get("content") == "Monthly spend"
+            for span in caption
+        )
+
+    def test_file_upload_id_stamped_block(self):
+        """A pre-uploaded path produces a file_upload-typed image block."""
+        block = NbjmBlock(
+            short_id="",
+            level=0,
+            block_type="image",
+            content="",
+            image_path="/tmp/chart.png",
+            image_file_upload_id="abc-upload-id",
+        )
+        result = nbjm_block_to_notion(block, IdRegistry())
+        assert result["type"] == "image"
+        assert result["image"]["type"] == "file_upload"
+        assert result["image"]["file_upload"]["id"] == "abc-upload-id"
 
 
 class TestTableRowVsQuote:
