@@ -3509,6 +3509,9 @@ class ApplyOp:
     source: Optional[str] = None
     dest_parent: Optional[str] = None
     dest_after: Optional[str] = None
+    # before=Y is resolved to after=<Y's preceding sibling> at
+    # execute time — Notion's append-children API takes after only.
+    dest_before: Optional[str] = None
     # For u command
     target: Optional[str] = None
     new_text: Optional[str] = None
@@ -3543,10 +3546,15 @@ class ApplyParseResult:
 # Regex patterns for command parsing
 ADD_CMD_PATTERN = re.compile(r'^\+\s+parent=(\S+)(?:\s+after=(\S+))?$')
 DELETE_CMD_PATTERN = re.compile(r'^x\s+(.+)$')
-MOVE_CMD_PATTERN = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)(?:\s+after=(\S+))?$')
+# m SOURCE -> parent=PARENT [after=SIBLING | before=SIBLING]
+MOVE_CMD_PATTERN = re.compile(
+    r'^m\s+(\S+)\s+->\s+parent=(\S+)'
+    r'(?:\s+after=(\S+)|\s+before=(\S+))?$'
+)
 # Patterns for detecting empty after= (common user error attempting to insert at beginning)
 ADD_CMD_EMPTY_AFTER = re.compile(r'^\+\s+parent=(\S+)\s+after=\s*$')
 MOVE_CMD_EMPTY_AFTER = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)\s+after=\s*$')
+MOVE_CMD_EMPTY_BEFORE = re.compile(r'^m\s+(\S+)\s+->\s+parent=(\S+)\s+before=\s*$')
 MOVE_CMD_MISSING_PARENT = re.compile(r'^m\s+(\S+)\s+->\s+after=(\S+)$')
 UPDATE_CMD_QUOTED = re.compile(r'^[ue]\s+(\S+)\s+=\s+"(.*)"\s*$')
 UPDATE_CMD_UNQUOTED = re.compile(r'^[ue]\s+(\S+)\s+=\s+(.+)$')
@@ -3591,13 +3599,12 @@ def _decode_escape_sequences(text: str) -> str:
     return ''.join(result)
 
 # Page command patterns
-# Groups: 1=parent, 2=after (optional), 3=pos (optional), 4=title, 5=icon, 6=cover
-ADD_PAGE_PATTERN = re.compile(
-    r'^\+page\s+parent=(\S+)'
-    r'(?:\s+after=(\S+))?'
-    r'(?:\s+pos=(\S+))?'
-    r'\s+title="([^"]*)"'
-    r'(?:\s+icon=(\S+))?(?:\s+cover=(\S+))?$'
+ADD_PAGE_PREFIX = re.compile(r'^\+page\s+')
+# Token: key=value where value is either "quoted" (with embedded
+# spaces ok) or a bare \S+ run. Any-order tokens are parsed by
+# _parse_kv_tokens.
+KV_TOKEN_PATTERN = re.compile(
+    r'(\w+)=(?:"([^"]*)"|(\S+))'
 )
 MOVE_PAGE_PATTERN = re.compile(r'^mpage\s+(\S+)\s+->\s+parent=(\S+)$')
 DELETE_PAGE_PATTERN = re.compile(r'^xpage\s+(\S+)$')
@@ -3624,6 +3631,33 @@ DELETE_PROP_PATTERN = re.compile(r'^xprop\s+db=(\S+)\s+(.+)$')
 RENAME_PROP_PATTERN = re.compile(
     r'^uprop\s+db=(\S+)\s+(.+?)\s+->\s+(.+)$'
 )
+
+
+def _parse_kv_tokens(rest: str) -> Optional[dict[str, str]]:
+    """Parse a string of key=value tokens into a dict.
+
+    Values may be "quoted" (whitespace allowed) or bare (\\S+).
+    Returns None if the string contains anything that isn't a
+    well-formed key=value token (rejects malformed input). Returns
+    a dict on success — duplicate keys overwrite (last wins).
+    """
+    tokens: dict[str, str] = {}
+    pos = 0
+    s = rest.strip()
+    while pos < len(s):
+        # Skip whitespace between tokens
+        ws = re.match(r'\s+', s[pos:])
+        if ws:
+            pos += ws.end()
+            continue
+        m = KV_TOKEN_PATTERN.match(s, pos)
+        if not m or m.start() != pos:
+            return None
+        key = m.group(1)
+        value = m.group(2) if m.group(2) is not None else m.group(3)
+        tokens[key] = value
+        pos = m.end()
+    return tokens
 
 
 def _check_missing_payload(
@@ -3733,6 +3767,22 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
+        if MOVE_CMD_EMPTY_BEFORE.match(line):
+            errors.append(NbjmParseError(
+                code="EMPTY_BEFORE_PARAM",
+                message="before= requires a block ID. Use before=BLOCK_ID to "
+                        "move directly before a specific sibling, or omit "
+                        "before= to move to the end.",
+                line=line_num,
+                excerpt=f"{line_num}|{line}",
+                suggestions=[
+                    "Use 'before=BLOCK_ID' to move before specific block",
+                    "Remove 'before=' to move to end",
+                ]
+            ))
+            i += 1
+            continue
+
         # Check for move missing parent= (common error: m X -> after=Y without parent=)
         match = MOVE_CMD_MISSING_PARENT.match(line)
         if match:
@@ -3805,7 +3855,7 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # m SOURCE -> parent=DEST [after=Y]
+        # m SOURCE -> parent=DEST [after=Y | before=Y]
         match = MOVE_CMD_PATTERN.match(line)
         if match:
             op = ApplyOp(
@@ -3813,7 +3863,8 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                 line_num=line_num,
                 source=match.group(1),
                 dest_parent=match.group(2),
-                dest_after=match.group(3)
+                dest_after=match.group(3),
+                dest_before=match.group(4),
             )
             operations.append(op)
             i += 1
@@ -3878,21 +3929,28 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
             i += 1
             continue
 
-        # +page parent=X [after=Y] [pos=start] title="Z" [icon=W] [cover=V]
-        match = ADD_PAGE_PATTERN.match(line)
-        if match:
-            after_id = match.group(2)
-            pos_value = match.group(3)
-            op = ApplyOp(
-                command=ApplyCommand.ADD_PAGE,
-                line_num=line_num,
-                parent=match.group(1),
-                after=after_id,
-                position=pos_value,
-                title=match.group(4),
-                icon=match.group(5),
-                cover=match.group(6)
-            )
+        # +page parent=X title="Z" [after=Y] [pos=start] [icon=W] [cover=V]
+        # Parameters may appear in any order. Required: parent, title.
+        prefix_match = ADD_PAGE_PREFIX.match(line)
+        page_op: Optional[ApplyOp] = None
+        if prefix_match:
+            tokens = _parse_kv_tokens(line[prefix_match.end():])
+            allowed = {"parent", "title", "after", "pos", "icon", "cover"}
+            if tokens is not None \
+                    and "parent" in tokens \
+                    and "title" in tokens \
+                    and set(tokens) <= allowed:
+                page_op = ApplyOp(
+                    command=ApplyCommand.ADD_PAGE,
+                    line_num=line_num,
+                    parent=tokens["parent"],
+                    after=tokens.get("after"),
+                    position=tokens.get("pos"),
+                    title=tokens["title"],
+                    icon=tokens.get("icon"),
+                    cover=tokens.get("cover"),
+                )
+        if page_op is not None:
             # Collect content blocks (code-block-aware)
             i += 1
             content_lines = []
@@ -3918,8 +3976,8 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                 else:
                     break
             if content_lines:
-                op.content_blocks = _parse_content_blocks(content_lines, errors, line_num)
-            operations.append(op)
+                page_op.content_blocks = _parse_content_blocks(content_lines, errors, line_num)
+            operations.append(page_op)
             continue
 
         # mpage SOURCE -> parent=DEST
@@ -4186,7 +4244,7 @@ def parse_apply_script(script: str, registry: IdRegistry) -> ApplyParseResult:
                       '+ parent=AbCd after=EfGh'),
             "x":     ('x BLOCK_ID [BLOCK_ID ...]',
                       'x AbCd EfGh'),
-            "m":     ('m SOURCE -> parent=PARENT [after=SIBLING]',
+            "m":     ('m SOURCE -> parent=PARENT [after=SIBLING | before=SIBLING]',
                       'm AbCd -> parent=EfGh after=IjKl'),
             "u":     ('u BLOCK_ID = "new text"  OR  u BLOCK_ID\\n  new text',
                       'u AbCd = "- Updated content"'),
@@ -4380,12 +4438,17 @@ def _auto_group_table_rows(blocks: list[NbjmBlock]) -> list[NbjmBlock]:
             i += 1
             continue
 
-        # Explicit !table N block — collect child rows directly
+        # Explicit !table N block — collect child rows directly.
+        # Pipe rows at the same indent (matching the notion_apply
+        # Approach 2 docstring) or at level+1 both attach as
+        # children. Without this, same-indent rows would form a
+        # separate synthetic table and the explicit one would be
+        # rejected by the Notion API as having zero children.
         if block.block_type == 'table' and block.structural and not block.children:
-            child_level = block.level + 1
+            allowed_levels = (block.level, block.level + 1)
             i += 1
             rows = []
-            while i < len(blocks) and blocks[i].level == child_level and \
+            while i < len(blocks) and blocks[i].level in allowed_levels and \
                     blocks[i].block_type in ('table_row', 'table_separator'):
                 if blocks[i].block_type == 'table_row':
                     rows.append(blocks[i])
@@ -5489,6 +5552,56 @@ async def clone_block_with_children(
     return clone, warnings
 
 
+async def _resolve_before_to_after_uuid(
+    parent_uuid: str,
+    before_uuid: str,
+    before_short_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve `before=Y` to `after=<Y's preceding sibling>`.
+
+    Notion's append-children API only supports `after`, so to
+    insert before Y we look up Y's preceding sibling Z and
+    insert after Z.
+
+    Returns:
+        Tuple of (after_uuid, error).
+        - (Z's UUID, None) on success.
+        - (None, error_msg) if before_uuid is not a child of
+          parent_uuid, or if Y is the first child (no predecessor —
+          Notion API does not support inserting at the start of a
+          block container).
+    """
+    try:
+        children = await _fetch_children_one_level(parent_uuid)
+    except Exception as e:
+        return None, f"Failed to fetch parent children: {e}"
+
+    parent_normalized = normalize_uuid(parent_uuid)
+    before_normalized = normalize_uuid(before_uuid)
+
+    prev_uuid: Optional[str] = None
+    for child in children:
+        child_id = child.get("id", "")
+        if not child_id:
+            continue
+        if normalize_uuid(child_id) == before_normalized:
+            if prev_uuid is None:
+                return None, (
+                    f"Cannot move before {before_short_id}: it is the "
+                    f"first child of the destination parent. The Notion "
+                    f"API does not support inserting at the beginning. "
+                    f"Pick a later anchor, or omit before= to move to end."
+                )
+            return prev_uuid, None
+        prev_uuid = child_id
+
+    return None, (
+        f"'before' block {before_short_id} is not a child of the "
+        f"destination parent. Pick a block that is a direct child of "
+        f"your target parent."
+    )
+
+
 async def _validate_after_is_sibling(
     parent_uuid: str,
     after_uuid: str,
@@ -6113,6 +6226,18 @@ async def execute_apply_op(
                     dest_uuid, after_uuid, registry, op.dest_after
                 )
                 if not is_valid:
+                    return {}, err_msg
+
+            # before=Y resolves to after=<Y's preceding sibling>.
+            before_id = _remap_id(op.dest_before, id_map)
+            if before_id:
+                before_uuid, err = _resolve_or_error(registry, before_id, "before")
+                if err:
+                    return {}, err
+                after_uuid, err_msg = await _resolve_before_to_after_uuid(
+                    dest_uuid, before_uuid, op.dest_before
+                )
+                if err_msg:
                     return {}, err_msg
 
             # Fetch source block to check type and movability
@@ -7118,6 +7243,7 @@ async def execute_apply_script(
             op.command == ApplyCommand.MOVE
             and op.dest_parent is not None
             and op.dest_after is None
+            and op.dest_before is None
         ),
         group_key_fn=lambda op: op.dest_parent,
     )
@@ -7793,8 +7919,9 @@ async def notion_apply(
     Block Commands:
         + parent=ID [after=ID]    Add blocks (indented content follows)
         x ID [ID2 ID3...]         Delete/archive blocks
-        m ID -> parent=ID [after=ID]  Move block (parent= always required,
-                                       even for same-parent reposition)
+        m ID -> parent=ID [after=ID | before=ID]
+                                  Move block (parent= always required,
+                                  even for same-parent reposition)
         u ID = "text"             Update block text (alias: e) (can change type!)
         t ID = 0|1                Toggle todo checkbox
 
@@ -7941,7 +8068,11 @@ async def notion_apply(
         — that round-trips through NBJM and loses formatting/mentions.
         m A1b2 -> parent=C3d4              Move to end of C3d4
         m A1b2 -> parent=C3d4 after=E5f6   Move after E5f6
+        m A1b2 -> parent=C3d4 before=E5f6  Move before E5f6
         m A1b2 -> parent=SAME after=X      Reposition (same parent)
+        before= and after= are mutually exclusive. The Notion API
+        cannot insert at the very start of a block container, so
+        before=FIRST_CHILD returns an error.
 
     Example - Batch operations:
         x Old1 Old2 Old3
@@ -7995,7 +8126,7 @@ async def notion_apply(
             "BLOCKS:\n"
             "  + parent=ID [after=ID]       Add blocks (content indented below)\n"
             "  x ID [ID2...]                Delete/archive blocks\n"
-            "  m ID -> parent=ID [after=ID] Move block\n"
+            "  m ID -> parent=ID [after=ID|before=ID] Move block\n"
             "  u ID = \"text\"               Update block text (alias: e)\n"
             "  t ID = 0|1                   Toggle todo checkbox\n"
             "\n"

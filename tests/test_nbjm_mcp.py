@@ -28,6 +28,7 @@ from nbjm_mcp import (
     _auto_group_table_rows,
     _build_property_value,
     _build_row_properties,
+    _resolve_before_to_after_uuid,
     _check_movability,
     _coerce_value,
     _detect_conflicts,
@@ -3244,6 +3245,126 @@ class TestMoveMissingParentError:
 
 
 # =============================================================================
+# m before= Tests
+# =============================================================================
+
+
+class TestMoveBefore:
+    """Tests for `m SRC -> parent=P before=Y` parsing.
+
+    The Notion API only supports `after`, so `before=Y` is resolved
+    at execution time to `after=<Y's preceding sibling>`. These
+    tests cover the parser layer.
+    """
+
+    def test_move_before_parses(self):
+        """m X -> parent=P before=Y parses with dest_before set."""
+        script = "m SRC1 -> parent=DST1 before=BEF1"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.command == ApplyCommand.MOVE
+        assert op.source == "SRC1"
+        assert op.dest_parent == "DST1"
+        assert op.dest_before == "BEF1"
+        assert op.dest_after is None
+
+    def test_move_after_still_parses(self):
+        """Existing m X -> parent=P after=Y still parses correctly."""
+        script = "m SRC1 -> parent=DST1 after=AFT1"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.dest_after == "AFT1"
+        assert op.dest_before is None
+
+    def test_move_before_empty_errors(self):
+        """before= with empty value gives a helpful error."""
+        script = "m SRC1 -> parent=DST1 before="
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 1
+        assert "before=" in result.errors[0].message
+
+    def test_move_before_and_after_rejected(self):
+        """Specifying both before= and after= is a syntax error."""
+        script = "m SRC1 -> parent=DST1 before=B after=A"
+        registry = IdRegistry()
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 1
+
+
+class TestResolveBeforeToAfter:
+    """Tests for _resolve_before_to_after_uuid (execution-time
+    resolution of before=Y to after=<Y's preceding sibling>)."""
+
+    def _children_response(self, ids: list[str]) -> list[dict]:
+        return [{"id": i, "type": "paragraph"} for i in ids]
+
+    def test_resolves_to_preceding_sibling(self, monkeypatch):
+        import nbjm_mcp
+        parent = "11111111-1111-1111-1111-111111111111"
+        first = "22222222-2222-2222-2222-222222222222"
+        second = "33333333-3333-3333-3333-333333333333"
+        third = "44444444-4444-4444-4444-444444444444"
+
+        async def mock_fetch(_id):
+            return self._children_response([first, second, third])
+        monkeypatch.setattr(
+            nbjm_mcp, "_fetch_children_one_level", mock_fetch
+        )
+
+        after_uuid, err = asyncio.run(
+            _resolve_before_to_after_uuid(parent, third, "ThiR")
+        )
+        assert err is None
+        assert after_uuid == second
+
+    def test_first_child_returns_error(self, monkeypatch):
+        """before=FIRST_CHILD has no predecessor — Notion API
+        cannot insert at the start. Surface a clear error."""
+        import nbjm_mcp
+        parent = "11111111-1111-1111-1111-111111111111"
+        first = "22222222-2222-2222-2222-222222222222"
+        second = "33333333-3333-3333-3333-333333333333"
+
+        async def mock_fetch(_id):
+            return self._children_response([first, second])
+        monkeypatch.setattr(
+            nbjm_mcp, "_fetch_children_one_level", mock_fetch
+        )
+
+        after_uuid, err = asyncio.run(
+            _resolve_before_to_after_uuid(parent, first, "FirS")
+        )
+        assert after_uuid is None
+        assert err is not None
+        assert "first child" in err
+
+    def test_before_not_a_child_returns_error(self, monkeypatch):
+        """before=Y where Y isn't a child of dest_parent errors."""
+        import nbjm_mcp
+        parent = "11111111-1111-1111-1111-111111111111"
+        sibling = "22222222-2222-2222-2222-222222222222"
+        outsider = "99999999-9999-9999-9999-999999999999"
+
+        async def mock_fetch(_id):
+            return self._children_response([sibling])
+        monkeypatch.setattr(
+            nbjm_mcp, "_fetch_children_one_level", mock_fetch
+        )
+
+        after_uuid, err = asyncio.run(
+            _resolve_before_to_after_uuid(parent, outsider, "OutS")
+        )
+        assert after_uuid is None
+        assert err is not None
+        assert "not a child" in err
+
+
+# =============================================================================
 # Movability Pre-Check Tests
 # =============================================================================
 
@@ -5575,6 +5696,43 @@ class TestTableAutoGrouping:
         result = _auto_group_table_rows(blocks)
         assert result[0].content == "4"  # 4 columns
 
+    def test_explicit_table_collects_same_level_pipe_rows(self):
+        """Explicit !table N attaches following pipe rows at the
+        SAME indent level. Matches Approach 2 in the notion_apply
+        docstring, which shows pipe rows at the same indent as
+        !table N. Without this, the explicit table is created
+        empty (Notion API rejects: children.length should be ≥ 1)
+        and a separate synthetic table is built from the rows."""
+        blocks = [
+            NbjmBlock(short_id="", level=1, block_type="table",
+                     content="3", structural=True),
+            NbjmBlock(short_id="", level=1, block_type="table_row",
+                     content="| Name | Status | Notes |"),
+            NbjmBlock(short_id="", level=1, block_type="table_row",
+                     content="| Task one | Done | Shipped |"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 1
+        assert result[0].block_type == "table"
+        assert result[0].structural is True
+        assert len(result[0].children) == 2
+
+    def test_explicit_table_still_collects_deeper_pipe_rows(self):
+        """Explicit !table N still attaches pipe rows at level+1
+        (the original supported form) — backward compat."""
+        blocks = [
+            NbjmBlock(short_id="", level=1, block_type="table",
+                     content="2", structural=True),
+            NbjmBlock(short_id="", level=2, block_type="table_row",
+                     content="| A | B |"),
+            NbjmBlock(short_id="", level=2, block_type="table_row",
+                     content="| 1 | 2 |"),
+        ]
+        result = _auto_group_table_rows(blocks)
+        assert len(result) == 1
+        assert result[0].block_type == "table"
+        assert len(result[0].children) == 2
+
 
 class TestNbjmBlockToNotionTable:
     """Tests for nbjm_block_to_notion with table blocks."""
@@ -6375,6 +6533,84 @@ class TestParsePagePosition:
         assert op.title == "Test"
         assert op.icon == "📄"
         assert op.cover == "https://example.com/img.png"
+
+    def test_page_title_before_after(self):
+        """+page accepts title= before after= (any param order)."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "BlId")
+        script = '+page parent=PaId title="Positional Test" after=BlId'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.title == "Positional Test"
+        assert op.after == "BlId"
+
+    def test_page_title_before_pos_start(self):
+        """+page accepts title= before pos=start."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId title="Start Test" pos=start'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.title == "Start Test"
+        assert op.position == "start"
+
+    def test_page_icon_before_title(self):
+        """+page accepts icon= before title=."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId icon=📝 title="Test"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.icon == "📝"
+        assert op.title == "Test"
+
+    def test_page_all_params_reversed(self):
+        """+page accepts all params in fully reversed order."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        registry.register("22345678-1234-1234-1234-123456789abc", "BlId")
+        script = (
+            '+page cover=https://example.com/c.png icon=📄 '
+            'title="Test" after=BlId parent=PaId'
+        )
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.parent == "PaId"
+        assert op.after == "BlId"
+        assert op.title == "Test"
+        assert op.icon == "📄"
+        assert op.cover == "https://example.com/c.png"
+
+    def test_page_missing_parent_errors(self):
+        """+page without parent= produces a syntax error."""
+        registry = IdRegistry()
+        script = '+page title="No Parent"'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 1
+
+    def test_page_missing_title_errors(self):
+        """+page without title= produces a syntax error."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page parent=PaId'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 1
+
+    def test_page_quoted_title_with_spaces_any_order(self):
+        """Quoted title with spaces parses correctly in any position."""
+        registry = IdRegistry()
+        registry.register("12345678-1234-1234-1234-123456789abc", "PaId")
+        script = '+page title="A B C D" parent=PaId'
+        result = parse_apply_script(script, registry)
+        assert len(result.errors) == 0
+        op = result.operations[0]
+        assert op.title == "A B C D"
+        assert op.parent == "PaId"
 
 
 class TestApplyLineResultFormat:
